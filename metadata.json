@@ -1,0 +1,6 @@
+{
+  "name": "Floating Controller",
+  "description": "16 Ghuti (Sixteen Soldiers) floating game assistant with 37-point board engine, deep Minimax calculation, zero material loss guarantee, backbone dominance, and on-screen move vector overlays.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
