@@ -13,108 +13,124 @@ class SholoGutiEngine(
     fun findBestMove(
         board: SholoGutiBoard,
         timeLimitMs: Long = DEFAULT_TIME_LIMIT_MS,
-        maxDepth: Int = 8,
+        maxDepth: Int = 32,
         onProgress: ((depth: Int, nodes: Long, bestMove: GutiMove?) -> Unit)? = null
     ): EngineResult {
-        val startTime = System.currentTimeMillis()
-        deadlineTimeMs = startTime + timeLimitMs
-        nodesCount = 0L
-        isTimeExhausted = false
+        return try {
+            val startTime = System.currentTimeMillis()
+            deadlineTimeMs = startTime + timeLimitMs
+            nodesCount = 0L
+            isTimeExhausted = false
 
-        val rootMoves = board.generateMoves(Piece.BLUE)
-        if (rootMoves.isEmpty()) {
-            return EngineResult(
-                bestMove = null,
-                score = -INFINITE_SCORE,
-                depthReached = 0,
-                nodesEvaluated = 0L,
-                durationMs = 0L,
-                isSafe = false,
-                statusMessage = "No legal moves available"
-            )
-        }
+            val rootMoves = board.generateMoves(Piece.BLUE)
+            if (rootMoves.isEmpty()) {
+                return EngineResult(
+                    bestMove = null,
+                    score = -INFINITE_SCORE,
+                    depthReached = 0,
+                    nodesEvaluated = 0L,
+                    durationMs = 0L,
+                    isSafe = false,
+                    statusMessage = "No legal moves available"
+                )
+            }
 
-        if (rootMoves.size == 1) {
-            val soleMove = rootMoves.first()
-            return EngineResult(
-                bestMove = soleMove,
-                score = 1000,
-                depthReached = 1,
-                nodesEvaluated = 1L,
-                durationMs = System.currentTimeMillis() - startTime,
-                isSafe = true,
-                statusMessage = "Forced move: ${soleMove.from} -> ${soleMove.to}"
-            )
-        }
+            var overallBestMove = rootMoves.first()
+            var overallBestScore = -INFINITE_SCORE
+            var depthCompleted = 0
 
-        var overallBestMove = rootMoves.first()
-        var overallBestScore = -INFINITE_SCORE
-        var depthCompleted = 0
+            // Initial immediate candidate update so UI instantly has a hint arrow
+            val initialSafeMove = rootMoves.firstOrNull { isMoveSafeFromImmediateLoss(board, it) } ?: overallBestMove
+            overallBestMove = initialSafeMove
+            try {
+                onProgress?.invoke(1, 1L, overallBestMove)
+            } catch (_: Throwable) {}
 
-        // Iterative Deepening
-        for (depth in 1..maxDepth) {
-            if (System.currentTimeMillis() >= deadlineTimeMs) break
+            // Iterative Deepening with full time utilization
+            // Iterative Deepening with full time utilization
+            for (depth in 1..maxDepth) {
+                if (System.currentTimeMillis() >= deadlineTimeMs) break
 
-            var currentDepthBestMove: GutiMove? = null
-            var currentDepthBestScore = -INFINITE_SCORE
+                var currentDepthBestMove: GutiMove? = null
+                var currentDepthBestScore = -INFINITE_SCORE
+                var currentAlpha = -INFINITE_SCORE
+                val beta = INFINITE_SCORE
 
-            // Sort moves: Captures first, then center backbone moves
-            val sortedMoves = rootMoves.sortedWith(
-                compareByDescending<GutiMove> { it.isCapture }
-                    .thenByDescending { SholoGutiBoard.NODE_POINTS[it.to].isBackbone }
-            )
-
-            for (move in sortedMoves) {
-                if (System.currentTimeMillis() >= deadlineTimeMs) {
-                    isTimeExhausted = true
-                    break
-                }
-
-                val captured = board.makeMove(move)
-                nodesCount++
-
-                val score = -minimax(
-                    board = board,
-                    depth = depth - 1,
-                    alpha = -INFINITE_SCORE,
-                    beta = -currentDepthBestScore,
-                    isMaximizing = false
+                // Move ordering: Prioritize jumps, then center node 18, then backbone nodes
+                val sortedMoves = rootMoves.sortedWith(
+                    compareByDescending<GutiMove> { it.isCapture }
+                        .thenByDescending { it.to == 18 }
+                        .thenByDescending { SholoGutiBoard.NODE_POINTS.getOrNull(it.to)?.isBackbone == true }
                 )
 
-                board.unmakeMove(move, captured)
+                for (move in sortedMoves) {
+                    if (System.currentTimeMillis() >= deadlineTimeMs) {
+                        isTimeExhausted = true
+                        break
+                    }
 
-                val adjustedScore = if (enforceZeroLoss && !isMoveSafeFromImmediateLoss(board, move)) {
-                    score - SUICIDAL_PENALTY
-                } else {
-                    score
+                    val captured = board.makeMove(move)
+                    nodesCount++
+
+                    // Blue made move, next is Red minimizing (isMaximizing = false)
+                    val score = minimax(
+                        board = board,
+                        depth = depth - 1,
+                        alpha = currentAlpha,
+                        beta = beta,
+                        isMaximizing = false
+                    )
+
+                    board.unmakeMove(move, captured)
+
+                    val adjustedScore = if (enforceZeroLoss && !isMoveSafeFromImmediateLoss(board, move)) {
+                        score - SUICIDAL_PENALTY
+                    } else {
+                        score
+                    }
+
+                    if (adjustedScore > currentDepthBestScore) {
+                        currentDepthBestScore = adjustedScore
+                        currentDepthBestMove = move
+                    }
+                    currentAlpha = maxOf(currentAlpha, adjustedScore)
                 }
 
-                if (adjustedScore > currentDepthBestScore) {
-                    currentDepthBestScore = adjustedScore
-                    currentDepthBestMove = move
+                if (!isTimeExhausted && currentDepthBestMove != null) {
+                    overallBestMove = currentDepthBestMove
+                    overallBestScore = currentDepthBestScore
+                    depthCompleted = depth
+                    try {
+                        onProgress?.invoke(depth, nodesCount, overallBestMove)
+                    } catch (_: Throwable) {}
                 }
             }
 
-            if (!isTimeExhausted && currentDepthBestMove != null) {
-                overallBestMove = currentDepthBestMove
-                overallBestScore = currentDepthBestScore
-                depthCompleted = depth
-                onProgress?.invoke(depth, nodesCount, overallBestMove)
-            }
+            val duration = System.currentTimeMillis() - startTime
+            val safe = !enforceZeroLoss || isMoveSafeFromImmediateLoss(board, overallBestMove)
+
+            EngineResult(
+                bestMove = overallBestMove,
+                score = overallBestScore,
+                depthReached = depthCompleted.coerceAtLeast(1),
+                nodesEvaluated = nodesCount,
+                durationMs = duration,
+                isSafe = safe,
+                statusMessage = buildStatusMessage(overallBestMove, safe, depthCompleted.coerceAtLeast(1))
+            )
+        } catch (e: Throwable) {
+            e.printStackTrace()
+            val fallbackMove = try { board.generateMoves(Piece.BLUE).firstOrNull() } catch (_: Throwable) { null }
+            EngineResult(
+                bestMove = fallbackMove,
+                score = 0,
+                depthReached = 1,
+                nodesEvaluated = 1L,
+                durationMs = 0L,
+                isSafe = true,
+                statusMessage = fallbackMove?.let { "Move: ${it.from} → ${it.to}" } ?: "No moves found"
+            )
         }
-
-        val duration = System.currentTimeMillis() - startTime
-        val safe = !enforceZeroLoss || isMoveSafeFromImmediateLoss(board, overallBestMove)
-
-        return EngineResult(
-            bestMove = overallBestMove,
-            score = overallBestScore,
-            depthReached = depthCompleted.coerceAtLeast(1),
-            nodesEvaluated = nodesCount,
-            durationMs = duration,
-            isSafe = safe,
-            statusMessage = buildStatusMessage(overallBestMove, safe, depthCompleted)
-        )
     }
 
     private fun minimax(
@@ -132,8 +148,12 @@ class SholoGutiEngine(
         val player = if (isMaximizing) Piece.BLUE else Piece.RED
         val moves = board.generateMoves(player)
 
-        if (depth == 0 || moves.isEmpty()) {
-            return evaluate(board)
+        if (moves.isEmpty()) {
+            return if (isMaximizing) -INFINITE_SCORE else INFINITE_SCORE
+        }
+
+        if (depth <= 0) {
+            return quiescence(board, alpha, beta, isMaximizing, qDepth = 3)
         }
 
         var currentAlpha = alpha
@@ -141,7 +161,10 @@ class SholoGutiEngine(
 
         if (isMaximizing) {
             var maxEval = -INFINITE_SCORE
-            val sortedMoves = moves.sortedByDescending { it.isCapture }
+            val sortedMoves = moves.sortedWith(
+                compareByDescending<GutiMove> { it.isCapture }
+                    .thenByDescending { it.to == 18 || SholoGutiBoard.NODE_POINTS.getOrNull(it.to)?.isBackbone == true }
+            )
             for (move in sortedMoves) {
                 val captured = board.makeMove(move)
                 nodesCount++
@@ -151,11 +174,18 @@ class SholoGutiEngine(
                 maxEval = maxOf(maxEval, evaluation)
                 currentAlpha = maxOf(currentAlpha, evaluation)
                 if (currentBeta <= currentAlpha) break
+                if (System.currentTimeMillis() >= deadlineTimeMs) {
+                    isTimeExhausted = true
+                    break
+                }
             }
             return maxEval
         } else {
             var minEval = INFINITE_SCORE
-            val sortedMoves = moves.sortedByDescending { it.isCapture }
+            val sortedMoves = moves.sortedWith(
+                compareByDescending<GutiMove> { it.isCapture }
+                    .thenByDescending { it.to == 18 || SholoGutiBoard.NODE_POINTS.getOrNull(it.to)?.isBackbone == true }
+            )
             for (move in sortedMoves) {
                 val captured = board.makeMove(move)
                 nodesCount++
@@ -165,17 +195,82 @@ class SholoGutiEngine(
                 minEval = minOf(minEval, evaluation)
                 currentBeta = minOf(currentBeta, evaluation)
                 if (currentBeta <= currentAlpha) break
+                if (System.currentTimeMillis() >= deadlineTimeMs) {
+                    isTimeExhausted = true
+                    break
+                }
             }
             return minEval
         }
     }
 
+    /**
+     * Quiescence search on jump captures to resolve horizon effect and ensure piece safety.
+     */
+    private fun quiescence(
+        board: SholoGutiBoard,
+        alpha: Int,
+        beta: Int,
+        isMaximizing: Boolean,
+        qDepth: Int
+    ): Int {
+        if (System.currentTimeMillis() >= deadlineTimeMs) {
+            isTimeExhausted = true
+            return evaluate(board)
+        }
+
+        val standPat = evaluate(board)
+        if (qDepth <= 0) return standPat
+
+        val player = if (isMaximizing) Piece.BLUE else Piece.RED
+        val captureMoves = board.generateMoves(player).filter { it.isCapture }
+        if (captureMoves.isEmpty()) return standPat
+
+        var currentAlpha = alpha
+        var currentBeta = beta
+
+        if (isMaximizing) {
+            if (standPat >= currentBeta) return currentBeta
+            if (standPat > currentAlpha) currentAlpha = standPat
+
+            for (move in captureMoves) {
+                val captured = board.makeMove(move)
+                nodesCount++
+                val score = quiescence(board, currentAlpha, currentBeta, false, qDepth - 1)
+                board.unmakeMove(move, captured)
+
+                if (score >= currentBeta) return currentBeta
+                if (score > currentAlpha) currentAlpha = score
+            }
+            return currentAlpha
+        } else {
+            if (standPat <= currentAlpha) return currentAlpha
+            if (standPat < currentBeta) currentBeta = standPat
+
+            for (move in captureMoves) {
+                val captured = board.makeMove(move)
+                nodesCount++
+                val score = quiescence(board, currentAlpha, currentBeta, true, qDepth - 1)
+                board.unmakeMove(move, captured)
+
+                if (score <= currentAlpha) return currentAlpha
+                if (score < currentBeta) currentBeta = score
+            }
+            return currentBeta
+        }
+    }
+
     fun isMoveSafeFromImmediateLoss(board: SholoGutiBoard, blueMove: GutiMove): Boolean {
-        val captured = board.makeMove(blueMove)
-        val opponentCounterMoves = board.generateMoves(Piece.RED)
-        val hasImmediateCounterCapture = opponentCounterMoves.any { it.isCapture && it.captured == blueMove.to }
-        board.unmakeMove(blueMove, captured)
-        return !hasImmediateCounterCapture
+        return try {
+            val captured = board.makeMove(blueMove)
+            val opponentCounterMoves = board.generateMoves(Piece.RED)
+            val hasImmediateCounterCapture = opponentCounterMoves.any { it.isCapture && it.captured == blueMove.to }
+            board.unmakeMove(blueMove, captured)
+            // If the move was a capture, trading is acceptable; if it was a step, losing it immediately is a blunder
+            if (blueMove.isCapture) true else !hasImmediateCounterCapture
+        } catch (_: Throwable) {
+            true
+        }
     }
 
     fun evaluate(board: SholoGutiBoard): Int {
@@ -188,16 +283,33 @@ class SholoGutiEngine(
         var materialScore = (bluePieces - redPieces) * 1000
         var backboneScore = 0
         var wingScore = 0
+        var defenseScore = 0
 
         for (i in 0 until SholoGutiBoard.TOTAL_NODES) {
             val p = board.pieces[i]
+            if (p == Piece.EMPTY) continue
             val pt = SholoGutiBoard.NODE_POINTS[i]
+
+            // Center node 18 is the primary strategic pivot in 16 Ghuti
+            val isCenter = (i == 18)
+            val backboneWeightForNode = if (isCenter) backboneWeight * 2 else backboneWeight
+
             if (p == Piece.BLUE) {
-                if (pt.isBackbone) backboneScore += backboneWeight
-                if (pt.isWing) wingScore += wingWeight
-            } else if (p == Piece.RED) {
-                if (pt.isBackbone) backboneScore -= backboneWeight
-                if (pt.isWing) wingScore -= wingWeight
+                if (pt.isBackbone) backboneScore += backboneWeightForNode
+                if (pt.isWing) {
+                    val hasWingSupporter = SholoGutiBoard.ADJACENCY[i].any { board.pieces[it] == Piece.BLUE }
+                    wingScore += if (hasWingSupporter) wingWeight else -wingWeight
+                }
+                val friendlyNeighbors = SholoGutiBoard.ADJACENCY[i].count { board.pieces[it] == Piece.BLUE }
+                defenseScore += friendlyNeighbors * 15
+            } else {
+                if (pt.isBackbone) backboneScore -= backboneWeightForNode
+                if (pt.isWing) {
+                    val hasWingSupporter = SholoGutiBoard.ADJACENCY[i].any { board.pieces[it] == Piece.RED }
+                    wingScore -= if (hasWingSupporter) wingWeight else -wingWeight
+                }
+                val enemyNeighbors = SholoGutiBoard.ADJACENCY[i].count { board.pieces[it] == Piece.RED }
+                defenseScore -= enemyNeighbors * 15
             }
         }
 
@@ -205,7 +317,7 @@ class SholoGutiEngine(
         val redMobility = board.generateMoves(Piece.RED).size
         val mobilityScore = (blueMobility - redMobility) * mobilityWeight
 
-        return materialScore + backboneScore + wingScore + mobilityScore
+        return materialScore + backboneScore + wingScore + defenseScore + mobilityScore
     }
 
     private fun buildStatusMessage(move: GutiMove, isSafe: Boolean, depth: Int): String {

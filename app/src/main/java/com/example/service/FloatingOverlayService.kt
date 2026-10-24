@@ -12,7 +12,9 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -21,18 +23,23 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
-import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.aistudio.floatingbubble.kxpzqa.R
+import com.example.engine.Piece
+import com.example.engine.SholoGutiBoard
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.abs
 
 class FloatingOverlayService : Service() {
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var windowManager: WindowManager? = null
 
@@ -50,32 +57,99 @@ class FloatingOverlayService : Service() {
 
     // Control Bar Views
     private var hintBtnLabel: TextView? = null
-    private var syncBtnLayout: LinearLayout? = null
-    private var syncBtnIcon: ImageView? = null
+    private var autoHintBtnLayout: LinearLayout? = null
+    private var autoHintBtnLabel: TextView? = null
     private var alignBtnLayout: LinearLayout? = null
+    private var alignBtnLabel: TextView? = null
     private var hudToastView: TextView? = null
+
+    // Persistent background polling coroutine for Auto-Trigger Hint on Opponent Move
+    private var autoHintPollingJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        FloatingStateHolder.initPrefs(this)
+
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification())
+        startForegroundCompat()
+
+        // Set running status first so background coroutines can run
+        FloatingStateHolder.updateServiceRunningStatus(true)
 
         setup100PercentTransparentCanvasOverlay()
         setupMinimalistFloatingControlBar()
         setupAlignFloatingPopup()
 
         observeState()
-        FloatingStateHolder.updateServiceRunningStatus(true)
+        if (FloatingStateHolder.isAutoHintEnabled.value) {
+            startAutoHintPollingLoop()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> stopSelf()
+            ACTION_MEDIA_PROJECTION_START -> {
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, android.app.Activity.RESULT_CANCELED)
+                val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA)
+                }
+                if (resultCode == android.app.Activity.RESULT_OK && data != null) {
+                    // Android 14 requirement: Foreground service MUST transition to MEDIA_PROJECTION type
+                    // BEFORE calling getMediaProjection(resultCode, data)
+                    startForegroundWithMediaProjection()
+                    ScreenCaptureManager.initProjection(this, resultCode, data)
+                }
+            }
+            ACTION_MEDIA_PROJECTION_READY -> startForegroundCompat()
         }
         return START_STICKY
+    }
+
+    private fun startForegroundWithMediaProjection() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
+                        android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            } else {
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            }
+            startForeground(NOTIFICATION_ID, buildNotification(), type)
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification())
+        }
+    }
+
+    private fun startForegroundCompat() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val type = if (ScreenCaptureManager.isScreenCaptureActive.value) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
+                            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                } else {
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                }
+            } else {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                } else {
+                    0
+                }
+            }
+            if (type != 0) {
+                startForeground(NOTIFICATION_ID, buildNotification(), type)
+            } else {
+                startForeground(NOTIFICATION_ID, buildNotification())
+            }
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification())
+        }
     }
 
     private fun createNotificationChannel() {
@@ -110,10 +184,6 @@ class FloatingOverlayService : Service() {
             .build()
     }
 
-    /**
-     * Creates the 100% Transparent Fullscreen Overlay.
-     * Stays completely transparent during game play, rendering only the glowing move vector when hint is requested.
-     */
     @SuppressLint("ClickableViewAccessibility")
     private fun setup100PercentTransparentCanvasOverlay() {
         val wm = windowManager ?: return
@@ -159,9 +229,6 @@ class FloatingOverlayService : Service() {
         }
     }
 
-    /**
-     * Minimalist Floating Toolbar with Hint, Scan, Align, and Reset.
-     */
     @SuppressLint("ClickableViewAccessibility", "SetTextI18n")
     private fun setupMinimalistFloatingControlBar() {
         val wm = windowManager ?: return
@@ -169,14 +236,14 @@ class FloatingOverlayService : Service() {
         val container = FrameLayout(this)
         controlBarContainer = container
 
-        // Modern Glassmorphism Pill Container
+        // Modern Glassmorphism Pill Toolbar
         val toolbar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(8), dp(4), dp(8), dp(4))
 
             val bg = GradientDrawable().apply {
-                setColor(Color.parseColor("#E6121824")) // 90% opaque dark navy
+                setColor(Color.parseColor("#E6121824")) // 90% dark slate
                 cornerRadius = dp(28).toFloat()
                 setStroke(dp(1), Color.parseColor("#404E67"))
             }
@@ -214,44 +281,80 @@ class FloatingOverlayService : Service() {
             addView(hintBtnLabel)
 
             setOnClickListener {
-                if (FloatingStateHolder.isAnalyzing.value) return@setOnClickListener
+                try {
+                    if (FloatingStateHolder.isAnalyzing.value) return@setOnClickListener
 
-                // Deactivate align mode so hint arrow is clean on the real board
-                if (FloatingStateHolder.isAlignModeActive.value) {
-                    FloatingStateHolder.toggleAlignMode(false)
-                }
+                    // Strictly clear previous hint overlay and bestMove immediately to avoid duplicate arrows
+                    transparentCanvasView?.clearHint()
+                    FloatingStateHolder.clearBestMove()
 
-                showHudToast("Thinking best 16 Ghuti move...")
-                FloatingStateHolder.triggerAnalysis { result ->
-                    val move = result.bestMove
-                    if (move != null) {
-                        showHudToast("Hint: Move ${move.from} → ${move.to}")
-                    } else {
-                        showHudToast("No move found. Try Scan first!")
+                    // Dismiss alignment mode if open
+                    if (FloatingStateHolder.isAlignModeActive.value) {
+                        FloatingStateHolder.toggleAlignMode(false)
                     }
+
+                    if (ScreenCaptureManager.isScreenCaptureActive.value) {
+                        showHudToast("Scanning screen & computing hint...")
+                        performSafeScreenScan { summary ->
+                            try {
+                                FloatingStateHolder.setSyncMode(true)
+                                FloatingStateHolder.triggerScanFlash()
+                                if (summary.success) {
+                                    showHudToast("Scanned: ${summary.blueCount} Blue, ${summary.redCount} Red. Computing...")
+                                } else {
+                                    showHudToast(summary.message)
+                                }
+                                FloatingStateHolder.triggerAnalysis { result ->
+                                    val move = result.bestMove
+                                    if (move != null) {
+                                        val action = if (move.isCapture) "Capture jump" else "Step"
+                                        showHudToast("$action: ${move.from} → ${move.to}")
+                                    } else {
+                                        showHudToast("No valid move found")
+                                    }
+                                }
+                            } catch (e: Throwable) {
+                                e.printStackTrace()
+                                showHudToast("Hint error: ${e.localizedMessage ?: "Unknown"}")
+                            }
+                        }
+                    } else {
+                        FloatingStateHolder.setSyncMode(true)
+                        showHudToast("Calculating best 16 Ghuti move...")
+                        FloatingStateHolder.triggerAnalysis { result ->
+                            val move = result.bestMove
+                            if (move != null) {
+                                val action = if (move.isCapture) "Capture jump" else "Step"
+                                showHudToast("$action: ${move.from} → ${move.to}")
+                            } else {
+                                showHudToast("No move found. Start Screen Capture or Scan!")
+                            }
+                        }
+                    }
+                } catch (e: Throwable) {
+                    e.printStackTrace()
+                    showHudToast("Error: ${e.localizedMessage ?: "Try again"}")
                 }
             }
         }
         toolbar.addView(hintBtn)
 
-        // 2. "Scan" Button (Live screen sampling)
+        // 2. "Scan" Button (Live screen sampling & Permanent Floating Map Sync)
         val scanBtn = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(10), dp(6), dp(10), dp(6))
-            syncBtnLayout = this
 
             val scanBg = GradientDrawable().apply {
                 setColor(Color.parseColor("#1E293B"))
                 cornerRadius = dp(20).toFloat()
-                setStroke(dp(1), Color.parseColor("#334155"))
+                setStroke(dp(1), Color.parseColor("#38BDF8"))
             }
             background = scanBg
 
             val icon = ImageView(this@FloatingOverlayService).apply {
                 setImageResource(android.R.drawable.ic_menu_rotate)
                 setColorFilter(Color.parseColor("#38BDF8"))
-                syncBtnIcon = this
                 layoutParams = LinearLayout.LayoutParams(dp(16), dp(16)).apply {
                     marginEnd = dp(4)
                 }
@@ -267,13 +370,24 @@ class FloatingOverlayService : Service() {
             addView(label)
 
             setOnClickListener {
-                showHudToast("Scanning real game screen...")
-                ScreenCaptureManager.scanBoardFromScreen { summary ->
-                    if (summary.success) {
-                        showHudToast("Scanned: ${summary.blueCount} Blue, ${summary.redCount} Red ✓")
-                    } else {
-                        showHudToast(summary.message)
+                try {
+                    showHudToast("Scanning & syncing game board...")
+                    performSafeScreenScan { summary ->
+                        try {
+                            FloatingStateHolder.setSyncMode(true)
+                            FloatingStateHolder.triggerScanFlash()
+                            if (summary.success) {
+                                showHudToast("Synced: ${summary.blueCount} Blue, ${summary.redCount} Red ✓ (Map Permanent)")
+                            } else {
+                                showHudToast(summary.message)
+                            }
+                        } catch (e: Throwable) {
+                            e.printStackTrace()
+                        }
                     }
+                } catch (e: Throwable) {
+                    e.printStackTrace()
+                    showHudToast("Scan failed: ${e.localizedMessage ?: "Unknown"}")
                 }
             }
         }
@@ -285,7 +399,44 @@ class FloatingOverlayService : Service() {
         }
         toolbar.addView(scanBtn, scanParams)
 
-        // 3. "Align" Button (Interactive alignment tool toggle)
+        // 3. "Auto Hint" Toggle Button (Triggers 10s hint automatically 3s after opponent move)
+        val autoHintBtn = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+            autoHintBtnLayout = this
+
+            val isAuto = FloatingStateHolder.isAutoHintEnabled.value
+            val autoBg = GradientDrawable().apply {
+                setColor(if (isAuto) Color.parseColor("#083344") else Color.parseColor("#1E293B"))
+                cornerRadius = dp(20).toFloat()
+                setStroke(dp(1), if (isAuto) Color.parseColor("#22D3EE") else Color.parseColor("#334155"))
+            }
+            background = autoBg
+
+            autoHintBtnLabel = TextView(this@FloatingOverlayService).apply {
+                text = if (isAuto) "Auto: ON" else "Auto: OFF"
+                setTextColor(if (isAuto) Color.parseColor("#22D3EE") else Color.parseColor("#94A3B8"))
+                textSize = 12f
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+            }
+            addView(autoHintBtnLabel)
+
+            setOnClickListener {
+                FloatingStateHolder.toggleAutoHint()
+                val next = FloatingStateHolder.isAutoHintEnabled.value
+                showHudToast(if (next) "Auto-Hint ON: Triggers 3s after opponent moves ✓" else "Auto-Hint OFF")
+            }
+        }
+        val autoParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            marginStart = dp(6)
+        }
+        toolbar.addView(autoHintBtn, autoParams)
+
+        // 4. "Edit / Align" Button (Interactive alignment mode toggle)
         val alignBtn = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -308,20 +459,21 @@ class FloatingOverlayService : Service() {
             }
             addView(icon)
 
-            val label = TextView(this@FloatingOverlayService).apply {
-                text = "Align"
+            alignBtnLabel = TextView(this@FloatingOverlayService).apply {
+                text = "Edit / Align"
                 setTextColor(Color.parseColor("#FACC15"))
                 textSize = 12f
                 typeface = android.graphics.Typeface.DEFAULT_BOLD
             }
-            addView(label)
+            addView(alignBtnLabel)
 
             setOnClickListener {
                 FloatingStateHolder.toggleAlignMode()
                 val isNowActive = FloatingStateHolder.isAlignModeActive.value
                 if (isNowActive) {
-                    showHudToast("Align Mode ON: Drag screen or use controls to fit board")
+                    showHudToast("Drag screen with 1 finger | Pinch to scale")
                 } else {
+                    FloatingStateHolder.savePrefs()
                     showHudToast("Board Locked ✓ 100% Transparent Overlay")
                 }
             }
@@ -334,7 +486,7 @@ class FloatingOverlayService : Service() {
         }
         toolbar.addView(alignBtn, alignParams)
 
-        // 4. "Reset" / Clear Move Button
+        // 5. "Reset" / Clear Move Button
         val resetBtn = ImageView(this).apply {
             setImageResource(android.R.drawable.ic_menu_revert)
             setColorFilter(Color.parseColor("#94A3B8"))
@@ -348,8 +500,10 @@ class FloatingOverlayService : Service() {
                 marginStart = dp(6)
             }
             setOnClickListener {
+                transparentCanvasView?.clearHint()
                 FloatingStateHolder.clearBestMove()
-                showHudToast("Overlay cleared")
+                FloatingStateHolder.setSyncMode(false)
+                showHudToast("Overlay map & hints cleared")
             }
         }
         toolbar.addView(resetBtn)
@@ -397,7 +551,6 @@ class FloatingOverlayService : Service() {
         }
         container.addView(hudToastView, toastParams)
 
-        // Window Layout Params for Floating Control Bar
         controlBarParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -459,8 +612,42 @@ class FloatingOverlayService : Service() {
     }
 
     /**
-     * Floating Calibration Tool Panel:
-     * Nudge D-Pad (Up, Down, Left, Right), Size (+/-), Wings (+/-), Reset & Lock.
+     * Safely executes screen scanning by temporarily hiding the transparent overlay.
+     * This prevents our own rendered beads and hint arrows from being re-captured
+     * into the screen capture buffer, completely eliminating ghost and duplicate pieces.
+     */
+    private fun performSafeScreenScan(onFinished: (ScanSummary) -> Unit) {
+        val canvas = transparentCanvasView
+        canvas?.clearHint()
+        val wasVisible = (canvas?.visibility == View.VISIBLE)
+        if (canvas != null) {
+            canvas.visibility = View.INVISIBLE
+        }
+        mainHandler.postDelayed({
+            try {
+                ScreenCaptureManager.scanBoardFromScreen { summary ->
+                    try {
+                        if (wasVisible || FloatingStateHolder.isSyncModeActive.value) {
+                            canvas?.visibility = View.VISIBLE
+                        }
+                        onFinished(summary)
+                    } catch (e: Throwable) {
+                        e.printStackTrace()
+                        canvas?.visibility = View.VISIBLE
+                        onFinished(summary)
+                    }
+                }
+            } catch (e: Throwable) {
+                canvas?.visibility = View.VISIBLE
+                e.printStackTrace()
+                onFinished(ScanSummary(0, 0, 37, false, "Scan failed: ${e.message}"))
+            }
+        }, 120L)
+    }
+
+    /**
+     * Enhanced Floating Alignment HUD:
+     * D-Pad fine nudging, Scale, Wings, Presets, and Lock button.
      */
     @SuppressLint("SetTextI18n")
     private fun setupAlignFloatingPopup() {
@@ -472,17 +659,17 @@ class FloatingOverlayService : Service() {
             setPadding(dp(14), dp(10), dp(14), dp(12))
 
             val bg = GradientDrawable().apply {
-                setColor(Color.parseColor("#F20F172A")) // Slate 900
+                setColor(Color.parseColor("#F50F172A")) // Dark Navy
                 cornerRadius = dp(20).toFloat()
                 setStroke(dp(2), Color.parseColor("#FACC15")) // Gold border in align mode
             }
             background = bg
-            elevation = dp(12).toFloat()
+            elevation = dp(14).toFloat()
         }
 
         // Header Title
         val header = TextView(this).apply {
-            text = "🎯 Board Alignment & Calibration"
+            text = "🎯 16 Ghuti Board Alignment"
             setTextColor(Color.parseColor("#FACC15"))
             textSize = 13f
             typeface = android.graphics.Typeface.DEFAULT_BOLD
@@ -490,30 +677,23 @@ class FloatingOverlayService : Service() {
         }
         alignPopupContainer?.addView(header)
 
-        // Subtitle instructions
         val sub = TextView(this).apply {
-            text = "Drag screen directly or use arrows to fit 37 nodes"
+            text = "1-Finger Drag to Move | 2-Finger Pinch to Resize | Arrows to Nudge"
             setTextColor(Color.parseColor("#94A3B8"))
             textSize = 10f
             gravity = Gravity.CENTER
-            setPadding(0, dp(2), 0, dp(8))
+            setPadding(0, dp(2), 0, dp(6))
         }
         alignPopupContainer?.addView(sub)
 
-        // 1. D-Pad Directional Controls for fine pixel nudging
-        val dpad = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
-
-        fun createNudgeBtn(text: String, onClick: () -> Unit): TextView {
+        fun createBtn(text: String, onClick: () -> Unit): TextView {
             return TextView(this).apply {
                 this.text = text
                 setTextColor(Color.WHITE)
-                textSize = 13f
+                textSize = 12f
                 gravity = Gravity.CENTER
                 typeface = android.graphics.Typeface.DEFAULT_BOLD
-                setPadding(dp(10), dp(4), dp(10), dp(4))
+                setPadding(dp(10), dp(5), dp(10), dp(5))
                 val btnBg = GradientDrawable().apply {
                     setColor(Color.parseColor("#1E293B"))
                     cornerRadius = dp(8).toFloat()
@@ -524,60 +704,55 @@ class FloatingOverlayService : Service() {
             }
         }
 
-        // Up button
+        // 1. D-Pad Arrows for single-pixel precision nudging
+        val dpad = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+
         val upRow = LinearLayout(this).apply {
             gravity = Gravity.CENTER_HORIZONTAL
-            addView(createNudgeBtn("▲ Up") {
-                FloatingStateHolder.nudgeOffset(0f, -0.01f)
-            })
+            addView(createBtn("▲ Up") { FloatingStateHolder.nudgeOffset(0f, -0.003f) })
         }
         dpad.addView(upRow)
 
-        // Left, Center, Right row
         val midRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(0, dp(4), 0, dp(4))
+            setPadding(0, dp(3), 0, dp(3))
 
-            addView(createNudgeBtn("◀ Left") {
-                FloatingStateHolder.nudgeOffset(-0.01f, 0f)
-            })
+            addView(createBtn("◀ Left") { FloatingStateHolder.nudgeOffset(-0.003f, 0f) })
 
-            val resetNudge = createNudgeBtn("Reset") {
-                FloatingStateHolder.resetCalibrationToDefault()
-                showHudToast("Reset to default layout")
+            val centerBtn = createBtn("Center") {
+                FloatingStateHolder.setBoardHorizontalOffset(FloatingStateHolder.DEFAULT_H_OFFSET)
+                FloatingStateHolder.setBoardVerticalOffset(FloatingStateHolder.DEFAULT_V_OFFSET)
             }
-            val resetParams = LinearLayout.LayoutParams(
+            val cParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                marginStart = dp(8)
-                marginEnd = dp(8)
+                marginStart = dp(6)
+                marginEnd = dp(6)
             }
-            addView(resetNudge, resetParams)
+            addView(centerBtn, cParams)
 
-            addView(createNudgeBtn("Right ▶") {
-                FloatingStateHolder.nudgeOffset(0.01f, 0f)
-            })
+            addView(createBtn("Right ▶") { FloatingStateHolder.nudgeOffset(0.003f, 0f) })
         }
         dpad.addView(midRow)
 
-        // Down button
         val downRow = LinearLayout(this).apply {
             gravity = Gravity.CENTER_HORIZONTAL
-            addView(createNudgeBtn("▼ Down") {
-                FloatingStateHolder.nudgeOffset(0f, 0.01f)
-            })
+            addView(createBtn("▼ Down") { FloatingStateHolder.nudgeOffset(0f, 0.003f) })
         }
         dpad.addView(downRow)
 
         alignPopupContainer?.addView(dpad)
 
-        // 2. Size & Wings Controls Row
-        val controlsRow = LinearLayout(this).apply {
+        // 2. Adjustments Row: Board Size, Vertical Scale, Wings Height, Wings Width
+        val adjustmentsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(0, dp(10), 0, dp(8))
+            setPadding(0, dp(8), 0, dp(6))
 
             fun createControlGroup(title: String, onMinus: () -> Unit, onPlus: () -> Unit): LinearLayout {
                 return LinearLayout(this@FloatingOverlayService).apply {
@@ -595,53 +770,140 @@ class FloatingOverlayService : Service() {
                         orientation = LinearLayout.HORIZONTAL
                         setPadding(0, dp(2), 0, 0)
 
-                        val minusBtn = createNudgeBtn(" - ") { onMinus() }
+                        val minusBtn = createBtn(" - ") { onMinus() }
                         addView(minusBtn)
 
-                        val plusBtn = createNudgeBtn(" + ") { onPlus() }
+                        val plusBtn = createBtn(" + ") { onPlus() }
                         val pParams = LinearLayout.LayoutParams(
                             LinearLayout.LayoutParams.WRAP_CONTENT,
                             LinearLayout.LayoutParams.WRAP_CONTENT
-                        ).apply { marginStart = dp(6) }
+                        ).apply { marginStart = dp(4) }
                         addView(plusBtn, pParams)
                     }
                     addView(btnRow)
                 }
             }
 
-            val sizeGroup = createControlGroup("Board Size",
+            val sizeGroup = createControlGroup("Size",
                 onMinus = {
-                    val current = FloatingStateHolder.boardScaleFactor.value
-                    FloatingStateHolder.setBoardScale(current - 0.02f)
+                    val cur = FloatingStateHolder.boardScaleFactor.value
+                    FloatingStateHolder.setBoardScale(cur - 0.015f)
                 },
                 onPlus = {
-                    val current = FloatingStateHolder.boardScaleFactor.value
-                    FloatingStateHolder.setBoardScale(current + 0.02f)
+                    val cur = FloatingStateHolder.boardScaleFactor.value
+                    FloatingStateHolder.setBoardScale(cur + 0.015f)
                 }
             )
             addView(sizeGroup)
 
-            val wingGroup = createControlGroup("Triangle Wings",
+            val vScaleGroup = createControlGroup("Height",
                 onMinus = {
-                    val current = FloatingStateHolder.triangleRatio.value
-                    FloatingStateHolder.setTriangleRatio(current - 0.05f)
+                    val cur = FloatingStateHolder.boardVerticalScaleFactor.value
+                    FloatingStateHolder.setBoardVerticalScale(cur - 0.015f)
                 },
                 onPlus = {
-                    val current = FloatingStateHolder.triangleRatio.value
-                    FloatingStateHolder.setTriangleRatio(current + 0.05f)
+                    val cur = FloatingStateHolder.boardVerticalScaleFactor.value
+                    FloatingStateHolder.setBoardVerticalScale(cur + 0.015f)
                 }
             )
-            val wingParams = LinearLayout.LayoutParams(
+            val vsParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { marginStart = dp(16) }
-            addView(wingGroup, wingParams)
-        }
-        alignPopupContainer?.addView(controlsRow)
+            ).apply { marginStart = dp(10) }
+            addView(vScaleGroup, vsParams)
 
-        // 3. "Done & Lock" Button
+            val wingHeightGroup = createControlGroup("Wings H",
+                onMinus = {
+                    val cur = FloatingStateHolder.triangleRatio.value
+                    FloatingStateHolder.setTriangleRatio(cur - 0.02f)
+                },
+                onPlus = {
+                    val cur = FloatingStateHolder.triangleRatio.value
+                    FloatingStateHolder.setTriangleRatio(cur + 0.02f)
+                }
+            )
+            val whParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(10) }
+            addView(wingHeightGroup, whParams)
+
+            val wingWidthGroup = createControlGroup("Wings W",
+                onMinus = {
+                    val cur = FloatingStateHolder.triangleWidthRatio.value
+                    FloatingStateHolder.setTriangleWidthRatio(cur - 0.02f)
+                },
+                onPlus = {
+                    val cur = FloatingStateHolder.triangleWidthRatio.value
+                    FloatingStateHolder.setTriangleWidthRatio(cur + 0.02f)
+                }
+            )
+            val wwParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(10) }
+            addView(wingWidthGroup, wwParams)
+
+            val pieceSizeGroup = createControlGroup("Piece",
+                onMinus = {
+                    val cur = FloatingStateHolder.nodeRadiusFactor.value
+                    FloatingStateHolder.setNodeRadiusFactor(cur - 0.05f)
+                },
+                onPlus = {
+                    val cur = FloatingStateHolder.nodeRadiusFactor.value
+                    FloatingStateHolder.setNodeRadiusFactor(cur + 0.05f)
+                }
+            )
+            val psParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(10) }
+            addView(pieceSizeGroup, psParams)
+        }
+        alignPopupContainer?.addView(adjustmentsRow)
+
+        // 3. Quick Game Presets: AlignIt / Standard
+        val presetRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, dp(4), 0, dp(6))
+
+            fun createPresetChip(name: String, label: String): TextView {
+                return TextView(this@FloatingOverlayService).apply {
+                    text = label
+                    setTextColor(Color.parseColor("#38BDF8"))
+                    textSize = 10f
+                    setPadding(dp(8), dp(3), dp(8), dp(3))
+                    val chipBg = GradientDrawable().apply {
+                        setColor(Color.parseColor("#0F172A"))
+                        cornerRadius = dp(6).toFloat()
+                        setStroke(dp(1), Color.parseColor("#0284C7"))
+                    }
+                    background = chipBg
+                    setOnClickListener {
+                        FloatingStateHolder.applyPreset(name)
+                        showHudToast("Applied $label preset")
+                    }
+                }
+            }
+
+            addView(createPresetChip("AlignIt", "Default 16 Guti"))
+            val c1 = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(8) }
+            addView(createPresetChip("Compact", "Compact"), c1)
+            val c2 = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(8) }
+            addView(createPresetChip("Expanded", "Expanded"), c2)
+        }
+        alignPopupContainer?.addView(presetRow)
+
+        // 4. "Save & Lock Alignment" Button
         val doneBtn = TextView(this).apply {
-            text = "✓ Lock & Save Alignment"
+            text = "💾 Save & Lock Alignment (100% Transparent)"
             setTextColor(Color.parseColor("#003314"))
             textSize = 13f
             typeface = android.graphics.Typeface.DEFAULT_BOLD
@@ -653,8 +915,9 @@ class FloatingOverlayService : Service() {
             }
             background = doneBg
             setOnClickListener {
+                FloatingStateHolder.savePrefs()
                 FloatingStateHolder.toggleAlignMode(false)
-                showHudToast("Alignment saved! Background is 100% transparent ✓")
+                showHudToast("Alignment Saved Permanently! Overlay is 100% Transparent ✓")
             }
         }
         val doneParams = LinearLayout.LayoutParams(
@@ -665,7 +928,6 @@ class FloatingOverlayService : Service() {
         }
         alignPopupContainer?.addView(doneBtn, doneParams)
 
-        // Layout parameters for alignment popup
         alignPopupParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -674,7 +936,7 @@ class FloatingOverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = dp(32)
+            y = dp(28)
         }
 
         try {
@@ -686,18 +948,45 @@ class FloatingOverlayService : Service() {
 
     @SuppressLint("SetTextI18n")
     private fun observeState() {
-        // Observe best move and countdown
         serviceScope.launch {
-            FloatingStateHolder.bestMove.collect {
+            FloatingStateHolder.bestMove.collect { move ->
+                if (move == null) {
+                    transparentCanvasView?.clearHint()
+                }
                 refreshCanvasData()
             }
         }
 
         serviceScope.launch {
-            FloatingStateHolder.isAnalyzing.collect { analyzing ->
-                if (analyzing) {
-                    hintBtnLabel?.text = "Thinking..."
+            FloatingStateHolder.isAutoHintEnabled.collect { isAuto ->
+                val bg = autoHintBtnLayout?.background as? GradientDrawable
+                if (isAuto) {
+                    bg?.setColor(Color.parseColor("#083344"))
+                    bg?.setStroke(dp(1), Color.parseColor("#22D3EE"))
+                    autoHintBtnLabel?.text = "Auto: ON"
+                    autoHintBtnLabel?.setTextColor(Color.parseColor("#22D3EE"))
+                    startAutoHintPollingLoop()
                 } else {
+                    bg?.setColor(Color.parseColor("#1E293B"))
+                    bg?.setStroke(dp(1), Color.parseColor("#475569"))
+                    autoHintBtnLabel?.text = "Auto: OFF"
+                    autoHintBtnLabel?.setTextColor(Color.parseColor("#94A3B8"))
+                    stopAutoHintPollingLoop()
+                }
+            }
+        }
+
+        serviceScope.launch {
+            ScreenCaptureManager.isScreenCaptureActive.collect { isActive ->
+                if (isActive && FloatingStateHolder.isAutoHintEnabled.value) {
+                    startAutoHintPollingLoop()
+                }
+            }
+        }
+
+        serviceScope.launch {
+            FloatingStateHolder.isAnalyzing.collect { analyzing ->
+                if (!analyzing && FloatingStateHolder.analysisCountdownSec.value == 0) {
                     hintBtnLabel?.text = "10s Hint"
                 }
             }
@@ -707,11 +996,12 @@ class FloatingOverlayService : Service() {
             FloatingStateHolder.analysisCountdownSec.collect { sec ->
                 if (sec > 0) {
                     hintBtnLabel?.text = "Hint (${sec}s)"
+                } else if (!FloatingStateHolder.isAnalyzing.value) {
+                    hintBtnLabel?.text = "10s Hint"
                 }
             }
         }
 
-        // Observe calibration changes
         serviceScope.launch {
             FloatingStateHolder.boardVerticalOffsetFactor.collect { refreshCanvasData() }
         }
@@ -727,48 +1017,50 @@ class FloatingOverlayService : Service() {
         serviceScope.launch {
             FloatingStateHolder.triangleRatio.collect { refreshCanvasData() }
         }
+        serviceScope.launch {
+            FloatingStateHolder.triangleWidthRatio.collect { refreshCanvasData() }
+        }
+        serviceScope.launch {
+            FloatingStateHolder.nodeRadiusFactor.collect { refreshCanvasData() }
+        }
+        serviceScope.launch {
+            FloatingStateHolder.scanFlashActive.collect { refreshCanvasData() }
+        }
 
-        // Observe align mode active state
         serviceScope.launch {
             FloatingStateHolder.isAlignModeActive.collect { isAlign ->
                 alignPopupContainer?.visibility = if (isAlign) View.VISIBLE else View.GONE
-                updateCanvasTouchability(isAlign || FloatingStateHolder.isSyncModeActive.value)
+                updateCanvasTouchability(isAlign)
                 refreshCanvasData()
 
-                // Update Align button visuals in toolbar
                 val bg = alignBtnLayout?.background as? GradientDrawable
                 if (isAlign) {
-                    bg?.setColor(Color.parseColor("#422006")) // Amber dark
+                    bg?.setColor(Color.parseColor("#422006"))
                     bg?.setStroke(dp(1), Color.parseColor("#FACC15"))
+                    alignBtnLabel?.text = "Done"
                 } else {
                     bg?.setColor(Color.parseColor("#1E293B"))
                     bg?.setStroke(dp(1), Color.parseColor("#334155"))
+                    alignBtnLabel?.text = "Align"
                 }
             }
         }
 
-        // Observe sync mode
         serviceScope.launch {
             FloatingStateHolder.isSyncModeActive.collect { isSync ->
-                updateCanvasTouchability(isSync || FloatingStateHolder.isAlignModeActive.value)
+                updateCanvasTouchability(FloatingStateHolder.isAlignModeActive.value)
                 refreshCanvasData()
             }
         }
 
-        // Observe App Foreground State: Hide floating canvas when user is inside the MainActivity settings!
         serviceScope.launch {
             FloatingStateHolder.isAppInForeground.collect { inForeground ->
-                val canvas = transparentCanvasView
+                // Persistent Display: Transparent canvas must always be visible so hint arrow never vanishes
+                transparentCanvasView?.visibility = View.VISIBLE
                 if (inForeground) {
-                    // Hide overlay so 37-node board doesn't float over settings page
-                    canvas?.visibility = View.GONE
                     alignPopupContainer?.visibility = View.GONE
-                } else {
-                    // Show transparent canvas over the real 16 Ghuti game
-                    canvas?.visibility = View.VISIBLE
-                    if (FloatingStateHolder.isAlignModeActive.value) {
-                        alignPopupContainer?.visibility = View.VISIBLE
-                    }
+                } else if (FloatingStateHolder.isAlignModeActive.value) {
+                    alignPopupContainer?.visibility = View.VISIBLE
                 }
             }
         }
@@ -808,16 +1100,25 @@ class FloatingOverlayService : Service() {
             hOffset = FloatingStateHolder.boardHorizontalOffsetFactor.value,
             scale = FloatingStateHolder.boardScaleFactor.value,
             vScale = FloatingStateHolder.boardVerticalScaleFactor.value,
-            triRatio = FloatingStateHolder.triangleRatio.value
+            triRatio = FloatingStateHolder.triangleRatio.value,
+            triWidthRatio = FloatingStateHolder.triangleWidthRatio.value,
+            radiusFactor = FloatingStateHolder.nodeRadiusFactor.value,
+            flash = FloatingStateHolder.scanFlashActive.value
         )
     }
 
     private fun showHudToast(message: String) {
-        hudToastView?.let { view ->
-            view.text = message
-            view.visibility = View.VISIBLE
-            view.removeCallbacks(hideHudToastRunnable)
-            view.postDelayed(hideHudToastRunnable, 2600L)
+        mainHandler.post {
+            try {
+                hudToastView?.let { view ->
+                    view.text = message
+                    view.visibility = View.VISIBLE
+                    view.removeCallbacks(hideHudToastRunnable)
+                    view.postDelayed(hideHudToastRunnable, 2600L)
+                }
+            } catch (e: Throwable) {
+                e.printStackTrace()
+            }
         }
     }
 
@@ -829,7 +1130,147 @@ class FloatingOverlayService : Service() {
         return (value * resources.displayMetrics.density).toInt()
     }
 
+    /**
+     * Persistent background polling coroutine for 'Auto: ON' mode.
+     * Quietly scans the board state every 1.5 to 2 seconds (1800ms).
+     * As soon as a board state change is detected (meaning the opponent has made a move):
+     * Waits 3 seconds for animation stability, then automatically triggers the
+     * full 10-second hint calculation and renders the single hint arrow.
+     */
+    private fun startAutoHintPollingLoop() {
+        if (autoHintPollingJob?.isActive == true) return
+
+        autoHintPollingJob = serviceScope.launch(Dispatchers.Default) {
+            var lastObservedBoard: Array<Piece>? = null
+
+            // Seed initial baseline if existing board is already populated
+            val currentPieces = FloatingStateHolder.currentBoard.pieces
+            if (currentPieces.any { it != Piece.EMPTY }) {
+                lastObservedBoard = currentPieces.clone()
+            }
+
+            while (FloatingStateHolder.isOverlayServiceRunning.value &&
+                FloatingStateHolder.isAutoHintEnabled.value
+            ) {
+                // 2. Quietly scan the board state every 1.5 to 2 seconds (1800ms)
+                delay(1800L)
+
+                try {
+                    val isCaptureActive = ScreenCaptureManager.isScreenCaptureActive.value
+                    val isAutoHintOn = FloatingStateHolder.isAutoHintEnabled.value
+                    val isAnalyzing = FloatingStateHolder.isAnalyzing.value
+                    val isAlignMode = FloatingStateHolder.isAlignModeActive.value
+
+                    if (!isCaptureActive || !isAutoHintOn || isAnalyzing || isAlignMode) {
+                        continue
+                    }
+
+                    // Quiet non-intrusive snapshot from ImageReader / screen frame
+                    val currentSample = ScreenCaptureManager.sampleCurrentBoardFromScreen() ?: continue
+                    val blueCount = currentSample.count { it == Piece.BLUE }
+                    val redCount = currentSample.count { it == Piece.RED }
+
+                    // Skip empty or transient black frames
+                    if (blueCount + redCount < 2) {
+                        continue
+                    }
+
+                    // Initialize baseline if this is our first successful frame
+                    if (lastObservedBoard == null) {
+                        lastObservedBoard = currentSample.clone()
+                        withContext(Dispatchers.Main) {
+                            FloatingStateHolder.updateAllNodes(currentSample)
+                        }
+                        continue
+                    }
+
+                    val previous = lastObservedBoard ?: continue
+
+                    // Check if board state has changed
+                    if (!currentSample.contentEquals(previous)) {
+                        val prevBlue = previous.count { it == Piece.BLUE }
+                        val prevRed = previous.count { it == Piece.RED }
+
+                        val redPositionsChanged = (prevRed != redCount) || (0 until SholoGutiBoard.TOTAL_NODES).any { idx ->
+                            previous[idx] == Piece.RED && currentSample[idx] != Piece.RED
+                        }
+                        val blueCaptured = (blueCount < prevBlue)
+                        val isOpponentMove = redPositionsChanged || blueCaptured
+
+                        // User move detection
+                        val bluePositionsChanged = (prevBlue != blueCount) || (0 until SholoGutiBoard.TOTAL_NODES).any { idx ->
+                            previous[idx] == Piece.BLUE && currentSample[idx] != Piece.BLUE
+                        }
+
+                        if (!isOpponentMove && bluePositionsChanged) {
+                            // User just executed a move! Clear the old hint arrow and update baseline
+                            withContext(Dispatchers.Main) {
+                                transparentCanvasView?.clearHint()
+                                FloatingStateHolder.clearBestMove()
+                                FloatingStateHolder.updateAllNodes(currentSample)
+                            }
+                            lastObservedBoard = currentSample.clone()
+                            continue
+                        }
+
+                        // Opponent move detected (or board state changed)
+                        withContext(Dispatchers.Main) {
+                            // Clear old hint arrow immediately to prevent overlapping arrows
+                            transparentCanvasView?.clearHint()
+                            FloatingStateHolder.clearBestMove()
+                            showHudToast("Opponent moved! Waiting 3s for stability...")
+                        }
+
+                        // 3. Wait 3 seconds for animation and board stability
+                        delay(3000L)
+
+                        // Quietly re-sample after 3s to guarantee final settled state
+                        val stableSample = ScreenCaptureManager.sampleCurrentBoardFromScreen() ?: currentSample
+                        val stableBlue = stableSample.count { it == Piece.BLUE }
+                        val stableRed = stableSample.count { it == Piece.RED }
+
+                        if (stableBlue + stableRed >= 2) {
+                            lastObservedBoard = stableSample.clone()
+
+                            withContext(Dispatchers.Main) {
+                                // Clear prior hint
+                                transparentCanvasView?.clearHint()
+                                FloatingStateHolder.clearBestMove()
+
+                                // Update board state and trigger flash indicator
+                                FloatingStateHolder.updateAllNodes(stableSample)
+                                FloatingStateHolder.triggerScanFlash()
+                                showHudToast("Board Stable ✓ Auto-calculating 10s Hint...")
+
+                                // Automatically trigger the 10-second hint calculation and render hint arrow
+                                FloatingStateHolder.triggerAnalysis { res ->
+                                    val move = res.bestMove
+                                    if (move != null) {
+                                        val action = if (move.isCapture) "Capture jump" else "Step"
+                                        showHudToast("Auto-Hint: $action ${move.from} → ${move.to} ✓")
+                                    } else {
+                                        showHudToast("Auto-Hint: No valid move found")
+                                    }
+                                }
+                            }
+                        } else {
+                            lastObservedBoard = currentSample.clone()
+                        }
+                    }
+                } catch (e: Throwable) {
+                    e.printStackTrace()
+                }
+            }
+        }
+    }
+
+    private fun stopAutoHintPollingLoop() {
+        autoHintPollingJob?.cancel()
+        autoHintPollingJob = null
+    }
+
     override fun onDestroy() {
+        stopAutoHintPollingLoop()
         val wm = windowManager
         transparentCanvasView?.let {
             try { wm?.removeView(it) } catch (e: Exception) { e.printStackTrace() }
@@ -848,6 +1289,10 @@ class FloatingOverlayService : Service() {
     companion object {
         const val ACTION_START = "com.example.service.ACTION_START"
         const val ACTION_STOP = "com.example.service.ACTION_STOP"
+        const val ACTION_MEDIA_PROJECTION_START = "com.example.service.ACTION_MEDIA_PROJECTION_START"
+        const val ACTION_MEDIA_PROJECTION_READY = "com.example.service.ACTION_MEDIA_PROJECTION_READY"
+        const val EXTRA_RESULT_CODE = "com.example.service.EXTRA_RESULT_CODE"
+        const val EXTRA_RESULT_DATA = "com.example.service.EXTRA_RESULT_DATA"
         private const val NOTIFICATION_CHANNEL_ID = "floating_controller_channel"
         private const val NOTIFICATION_ID = 1001
 
@@ -867,6 +1312,30 @@ class FloatingOverlayService : Service() {
                 action = ACTION_STOP
             }
             context.stopService(intent)
+        }
+
+        fun startWithMediaProjection(context: Context, resultCode: Int, data: Intent) {
+            val intent = Intent(context, FloatingOverlayService::class.java).apply {
+                action = ACTION_MEDIA_PROJECTION_START
+                putExtra(EXTRA_RESULT_CODE, resultCode)
+                putExtra(EXTRA_RESULT_DATA, data)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        fun updateMediaProjectionForeground(context: Context) {
+            val intent = Intent(context, FloatingOverlayService::class.java).apply {
+                action = ACTION_MEDIA_PROJECTION_READY
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
         }
     }
 }
