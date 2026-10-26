@@ -111,6 +111,7 @@ fun FloatingScreen(
     val nodeRadiusFactor by viewModel.nodeRadiusFactor.collectAsStateWithLifecycle()
     val isAlignModeActive by viewModel.isAlignModeActive.collectAsStateWithLifecycle()
     val isAutoHintEnabled by viewModel.isAutoHintEnabled.collectAsStateWithLifecycle()
+    val isAutoClickerEnabled by viewModel.isAutoClickerEnabled.collectAsStateWithLifecycle()
 
     Scaffold(
         topBar = {
@@ -350,6 +351,77 @@ fun FloatingScreen(
                                 uncheckedTrackColor = Color(0xFF1E293B)
                             ),
                             modifier = Modifier.testTag("auto_hint_toggle_switch")
+                        )
+                    }
+                }
+            }
+
+            // Auto-Clicker Feature Card
+            item {
+                Card(
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF131D2E)),
+                    border = BorderStroke(
+                        1.dp,
+                        if (isAutoClickerEnabled) Color(0xFF00E676).copy(alpha = 0.5f) else Color(0xFF24334C)
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp)
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = "Auto-Clicker (Tap Automation)",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = if (isAutoClickerEnabled) "Active" else "Off",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (isAutoClickerEnabled) Color(0xFF00E676) else Color(0xFF94A3B8),
+                                    modifier = Modifier
+                                        .background(
+                                            if (isAutoClickerEnabled) Color(0xFF003314) else Color(0xFF1E293B),
+                                            RoundedCornerShape(6.dp)
+                                        )
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "When hint calculation completes, automatically taps the source piece, waits 400ms, then taps the destination square via AccessibilityService.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFF94A3B8)
+                            )
+                            if (!isAccessibilityGranted) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = "⚠️ Accessibility Permission required for tap automation.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color(0xFFFACC15)
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Switch(
+                            checked = isAutoClickerEnabled,
+                            onCheckedChange = { viewModel.toggleAutoClicker() },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = Color(0xFF00E676),
+                                uncheckedThumbColor = Color(0xFF94A3B8),
+                                uncheckedTrackColor = Color(0xFF1E293B)
+                            ),
+                            modifier = Modifier.testTag("auto_clicker_toggle_switch")
                         )
                     }
                 }

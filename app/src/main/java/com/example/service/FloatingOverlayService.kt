@@ -26,6 +26,7 @@ import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.aistudio.floatingbubble.kxpzqa.R
+import com.example.engine.GutiMove
 import com.example.engine.Piece
 import com.example.engine.SholoGutiBoard
 import kotlinx.coroutines.CoroutineScope
@@ -309,6 +310,7 @@ class FloatingOverlayService : Service() {
                                     if (move != null) {
                                         val action = if (move.isCapture) "Capture jump" else "Step"
                                         showHudToast("$action: ${move.from} → ${move.to}")
+                                        triggerAutoClickMove(move)
                                     } else {
                                         showHudToast("No valid move found")
                                     }
@@ -326,6 +328,7 @@ class FloatingOverlayService : Service() {
                             if (move != null) {
                                 val action = if (move.isCapture) "Capture jump" else "Step"
                                 showHudToast("$action: ${move.from} → ${move.to}")
+                                triggerAutoClickMove(move)
                             } else {
                                 showHudToast("No move found. Start Screen Capture or Scan!")
                             }
@@ -1131,6 +1134,88 @@ class FloatingOverlayService : Service() {
     }
 
     /**
+     * Automatically performs tap gestures on the screen using AccessibilityService dispatchGesture:
+     * 1. Tap on source node (piece to move).
+     * 2. After a 400ms stable animation delay, tap on destination node (target square).
+     */
+    private fun triggerAutoClickMove(move: GutiMove) {
+        if (!FloatingStateHolder.isAutoClickerEnabled.value) return
+
+        val accService = FloatingAccessibilityService.instance
+        if (accService == null) {
+            showHudToast("Hint ready! Enable Accessibility in App to auto-tap pieces.")
+            return
+        }
+
+        val canvas = transparentCanvasView
+        val (fromX, fromY) = canvas?.getNodeCoordinates(move.from)
+            ?: SholoGutiBoard.calculateNodeScreenPosition(
+                nodeIndex = move.from,
+                screenWidth = resources.displayMetrics.widthPixels.toFloat(),
+                screenHeight = resources.displayMetrics.heightPixels.toFloat(),
+                scaleFactor = FloatingStateHolder.boardScaleFactor.value,
+                verticalOffset = FloatingStateHolder.boardVerticalOffsetFactor.value,
+                horizontalOffset = FloatingStateHolder.boardHorizontalOffsetFactor.value,
+                verticalScale = FloatingStateHolder.boardVerticalScaleFactor.value,
+                triangleRatio = FloatingStateHolder.triangleRatio.value,
+                triangleWidthRatio = FloatingStateHolder.triangleWidthRatio.value
+            )
+
+        val (toX, toY) = canvas?.getNodeCoordinates(move.to)
+            ?: SholoGutiBoard.calculateNodeScreenPosition(
+                nodeIndex = move.to,
+                screenWidth = resources.displayMetrics.widthPixels.toFloat(),
+                screenHeight = resources.displayMetrics.heightPixels.toFloat(),
+                scaleFactor = FloatingStateHolder.boardScaleFactor.value,
+                verticalOffset = FloatingStateHolder.boardVerticalOffsetFactor.value,
+                horizontalOffset = FloatingStateHolder.boardHorizontalOffsetFactor.value,
+                verticalScale = FloatingStateHolder.boardVerticalScaleFactor.value,
+                triangleRatio = FloatingStateHolder.triangleRatio.value,
+                triangleWidthRatio = FloatingStateHolder.triangleWidthRatio.value
+            )
+
+        val chainPoints = move.chainSequence.map { nodeIdx ->
+            canvas?.getNodeCoordinates(nodeIdx)
+                ?: SholoGutiBoard.calculateNodeScreenPosition(
+                    nodeIndex = nodeIdx,
+                    screenWidth = resources.displayMetrics.widthPixels.toFloat(),
+                    screenHeight = resources.displayMetrics.heightPixels.toFloat(),
+                    scaleFactor = FloatingStateHolder.boardScaleFactor.value,
+                    verticalOffset = FloatingStateHolder.boardVerticalOffsetFactor.value,
+                    horizontalOffset = FloatingStateHolder.boardHorizontalOffsetFactor.value,
+                    verticalScale = FloatingStateHolder.boardVerticalScaleFactor.value,
+                    triangleRatio = FloatingStateHolder.triangleRatio.value,
+                    triangleWidthRatio = FloatingStateHolder.triangleWidthRatio.value
+                )
+        }
+
+        // Ensure canvas is non-touchable so gestures pass straight to the game
+        updateCanvasTouchability(false)
+
+        val tapMsg = if (move.isChainCapture) {
+            "Auto-Clicker: Chain Jump (${move.totalCaptures}x) ${move.from} → ${move.to}..."
+        } else {
+            "Auto-Clicker: Tapping ${move.from} → ${move.to}..."
+        }
+        showHudToast(tapMsg)
+
+        accService.executeMoveTaps(fromX, fromY, toX, toY, chainPoints) { success ->
+            mainHandler.post {
+                if (success) {
+                    val doneMsg = if (move.isChainCapture) {
+                        "Auto-Tap Done ✓ Multi-Jump ${move.totalCaptures}x (${move.from} → ${move.to})"
+                    } else {
+                        "Auto-Tap Done ✓ (${move.from} → ${move.to})"
+                    }
+                    showHudToast(doneMsg)
+                } else {
+                    showHudToast("Auto-Tap could not complete. Verify accessibility settings.")
+                }
+            }
+        }
+    }
+
+    /**
      * Persistent background polling coroutine for 'Auto: ON' mode.
      * Quietly scans the board state every 1.5 to 2 seconds (1800ms).
      * As soon as a board state change is detected (meaning the opponent has made a move):
@@ -1248,6 +1333,7 @@ class FloatingOverlayService : Service() {
                                     if (move != null) {
                                         val action = if (move.isCapture) "Capture jump" else "Step"
                                         showHudToast("Auto-Hint: $action ${move.from} → ${move.to} ✓")
+                                        triggerAutoClickMove(move)
                                     } else {
                                         showHudToast("Auto-Hint: No valid move found")
                                     }

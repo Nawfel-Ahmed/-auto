@@ -37,6 +37,9 @@ object FloatingStateHolder {
     private val _isAutoHintEnabled = MutableStateFlow(true)
     val isAutoHintEnabled: StateFlow<Boolean> = _isAutoHintEnabled.asStateFlow()
 
+    private val _isAutoClickerEnabled = MutableStateFlow(true)
+    val isAutoClickerEnabled: StateFlow<Boolean> = _isAutoClickerEnabled.asStateFlow()
+
     private val _lastActionMessage = MutableStateFlow("Ready")
     val lastActionMessage: StateFlow<String> = _lastActionMessage.asStateFlow()
 
@@ -129,6 +132,7 @@ object FloatingStateHolder {
                 _triangleWidthRatio.value = p.getFloat("triWidthRatio", DEFAULT_TRI_WIDTH_RATIO)
                 _nodeRadiusFactor.value = p.getFloat("nodeRadiusFactor", DEFAULT_NODE_RADIUS_FACTOR)
                 _isAutoHintEnabled.value = p.getBoolean("autoHintEnabled", true)
+                _isAutoClickerEnabled.value = p.getBoolean("autoClickerEnabled", true)
             }
         }
     }
@@ -143,6 +147,7 @@ object FloatingStateHolder {
             putFloat("triWidthRatio", _triangleWidthRatio.value)
             putFloat("nodeRadiusFactor", _nodeRadiusFactor.value)
             putBoolean("autoHintEnabled", _isAutoHintEnabled.value)
+            putBoolean("autoClickerEnabled", _isAutoClickerEnabled.value)
             apply()
         }
     }
@@ -152,6 +157,13 @@ object FloatingStateHolder {
         _isAutoHintEnabled.value = next
         savePrefs()
         _lastActionMessage.value = if (next) "Auto-Hint ON: Triggers 3s after opponent moves" else "Auto-Hint OFF"
+    }
+
+    fun toggleAutoClicker(enabled: Boolean? = null) {
+        val next = enabled ?: !_isAutoClickerEnabled.value
+        _isAutoClickerEnabled.value = next
+        savePrefs()
+        _lastActionMessage.value = if (next) "Auto-Clicker Enabled (Tap automation)" else "Auto-Clicker Disabled"
     }
 
     fun updateAccessibilityStatus(enabled: Boolean) {

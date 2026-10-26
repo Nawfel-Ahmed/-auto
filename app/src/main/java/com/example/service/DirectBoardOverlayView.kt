@@ -452,21 +452,33 @@ class DirectBoardOverlayView(context: Context) : View(context) {
         }
         canvas.drawPath(headPath, arrowHeadPaint)
 
-        // 5. If Jump Capture: Draw prominent Red 'X' on the captured piece
-        if (move.isCapture && move.captured in 0 until SholoGutiBoard.TOTAL_NODES) {
-            val (capX, capY) = getNodeCoordinates(move.captured)
-            val crossSize = baseRadius * 0.90f
-
-            val warningPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.parseColor("#B71C1C")
-                style = Paint.Style.STROKE
-                strokeWidth = 4f
+        // 5. Chain Jump Waypoints
+        if (move.chainSequence.isNotEmpty()) {
+            for (stepNode in move.chainSequence) {
+                if (stepNode in 0 until SholoGutiBoard.TOTAL_NODES) {
+                    val (sx, sy) = getNodeCoordinates(stepNode)
+                    canvas.drawCircle(sx, sy, baseRadius * 0.85f, toHaloRingPaint)
+                }
             }
-            canvas.drawCircle(capX, capY, crossSize * 1.30f, warningPaint)
+        }
 
-            // Red X
-            canvas.drawLine(capX - crossSize, capY - crossSize, capX + crossSize, capY + crossSize, captureXPaint)
-            canvas.drawLine(capX + crossSize, capY - crossSize, capX - crossSize, capY + crossSize, captureXPaint)
+        // 6. If Jump Capture: Draw prominent Red 'X' on all captured pieces (including chain captures)
+        val targetsToCross = if (move.allCaptured.isNotEmpty()) move.allCaptured else if (move.isCapture) listOf(move.captured) else emptyList()
+        val warningPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#B71C1C")
+            style = Paint.Style.STROKE
+            strokeWidth = 4f
+        }
+        for (capNode in targetsToCross) {
+            if (capNode in 0 until SholoGutiBoard.TOTAL_NODES) {
+                val (capX, capY) = getNodeCoordinates(capNode)
+                val crossSize = baseRadius * 0.90f
+
+                canvas.drawCircle(capX, capY, crossSize * 1.30f, warningPaint)
+                // Red X
+                canvas.drawLine(capX - crossSize, capY - crossSize, capX + crossSize, capY + crossSize, captureXPaint)
+                canvas.drawLine(capX + crossSize, capY - crossSize, capX - crossSize, capY + crossSize, captureXPaint)
+            }
         }
     }
 

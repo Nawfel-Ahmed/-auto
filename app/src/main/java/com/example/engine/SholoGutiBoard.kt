@@ -38,24 +38,51 @@ class SholoGutiBoard {
         val captureMoves = mutableListOf<GutiMove>()
         val stepMoves = mutableListOf<GutiMove>()
 
+        // 1. Mandatory Captures & Multi-Step Chain Jumps
         for (rule in JUMP_RULES) {
             if (pieces[rule.from] == player &&
                 pieces[rule.over] == opponent &&
                 pieces[rule.to] == Piece.EMPTY
             ) {
-                captureMoves.add(GutiMove(rule.from, rule.to, rule.over))
+                val chains = findChainJumpsFrom(rule.from, rule.to, rule.over, player, opponent)
+                if (chains.isNotEmpty()) {
+                    captureMoves.addAll(chains)
+                } else {
+                    captureMoves.add(
+                        GutiMove(
+                            from = rule.from,
+                            to = rule.to,
+                            captured = rule.over,
+                            chainSequence = emptyList(),
+                            totalCaptures = 1,
+                            allCaptured = listOf(rule.over)
+                        )
+                    )
+                }
             }
         }
 
+        // Mandatory Capture: In official 16 Ghuti, if any capture exists, player MUST capture
         if (captureMoves.isNotEmpty()) {
+            captureMoves.sortByDescending { it.totalCaptures }
             return captureMoves
         }
 
+        // 2. Quiet Step Moves (only legal when NO capture is available)
         for (i in 0 until TOTAL_NODES) {
             if (pieces[i] == player) {
                 for (neighbor in ADJACENCY[i]) {
                     if (pieces[neighbor] == Piece.EMPTY) {
-                        stepMoves.add(GutiMove(i, neighbor, -1))
+                        stepMoves.add(
+                            GutiMove(
+                                from = i,
+                                to = neighbor,
+                                captured = -1,
+                                chainSequence = emptyList(),
+                                totalCaptures = 0,
+                                allCaptured = emptyList()
+                            )
+                        )
                     }
                 }
             }
@@ -63,24 +90,101 @@ class SholoGutiBoard {
         return stepMoves
     }
 
-    fun makeMove(move: GutiMove): Piece {
+    private fun findChainJumpsFrom(
+        startNode: Int,
+        firstTo: Int,
+        firstOver: Int,
+        player: Piece,
+        opponent: Piece
+    ): List<GutiMove> {
+        val results = mutableListOf<GutiMove>()
+
+        fun searchChain(
+            currentNode: Int,
+            intermediates: MutableList<Int>,
+            capturedList: MutableList<Int>
+        ) {
+            var continued = false
+            for (rule in JUMP_RULES) {
+                if (rule.from == currentNode &&
+                    pieces[rule.over] == opponent &&
+                    pieces[rule.to] == Piece.EMPTY &&
+                    !capturedList.contains(rule.over)
+                ) {
+                    continued = true
+                    val savedOver = pieces[rule.over]
+                    pieces[currentNode] = Piece.EMPTY
+                    pieces[rule.to] = player
+                    pieces[rule.over] = Piece.EMPTY
+
+                    intermediates.add(rule.to)
+                    capturedList.add(rule.over)
+
+                    searchChain(rule.to, intermediates, capturedList)
+
+                    capturedList.removeAt(capturedList.size - 1)
+                    intermediates.removeAt(intermediates.size - 1)
+                    pieces[rule.over] = savedOver
+                    pieces[rule.to] = Piece.EMPTY
+                    pieces[currentNode] = player
+                }
+            }
+
+            if (!continued && intermediates.size > 1) {
+                val finalTo = intermediates.last()
+                val intermediateHops = intermediates.subList(0, intermediates.size - 1).toList()
+                results.add(
+                    GutiMove(
+                        from = startNode,
+                        to = finalTo,
+                        captured = firstOver,
+                        chainSequence = intermediateHops,
+                        totalCaptures = capturedList.size,
+                        allCaptured = capturedList.toList()
+                    )
+                )
+            }
+        }
+
+        // Simulate first jump
+        pieces[startNode] = Piece.EMPTY
+        pieces[firstTo] = player
+        val savedFirstOver = pieces[firstOver]
+        pieces[firstOver] = Piece.EMPTY
+
+        val intermediates = mutableListOf(firstTo)
+        val capturedList = mutableListOf(firstOver)
+
+        searchChain(firstTo, intermediates, capturedList)
+
+        // Revert first jump simulation
+        pieces[firstOver] = savedFirstOver
+        pieces[firstTo] = Piece.EMPTY
+        pieces[startNode] = player
+
+        return results
+    }
+
+    fun makeMove(move: GutiMove): List<Pair<Int, Piece>> {
         val movedPiece = pieces[move.from]
         pieces[move.from] = Piece.EMPTY
         pieces[move.to] = movedPiece
-        var capturedPiece = Piece.EMPTY
-        if (move.isCapture && move.captured in 0 until TOTAL_NODES) {
-            capturedPiece = pieces[move.captured]
-            pieces[move.captured] = Piece.EMPTY
+        val capturedPieces = mutableListOf<Pair<Int, Piece>>()
+        for (cap in move.allCaptured) {
+            if (cap in 0 until TOTAL_NODES) {
+                capturedPieces.add(Pair(cap, pieces[cap]))
+                pieces[cap] = Piece.EMPTY
+            }
         }
-        return capturedPiece
+        return capturedPieces
     }
 
-    fun unmakeMove(move: GutiMove, capturedPiece: Piece) {
+    fun unmakeMove(move: GutiMove, capturedPieces: List<Pair<Int, Piece>>) {
         val movedPiece = pieces[move.to]
         pieces[move.to] = Piece.EMPTY
         pieces[move.from] = movedPiece
-        if (move.isCapture && move.captured in 0 until TOTAL_NODES) {
-            pieces[move.captured] = capturedPiece
+        for ((node, piece) in capturedPieces) {
+            pieces[node] = piece
         }
     }
 

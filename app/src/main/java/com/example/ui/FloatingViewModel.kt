@@ -19,6 +19,7 @@ class FloatingViewModel : ViewModel() {
     val isServiceRunning: StateFlow<Boolean> = FloatingStateHolder.isOverlayServiceRunning
     val isAutoPlayActive: StateFlow<Boolean> = FloatingStateHolder.isAutoPlayActive
     val isAutoHintEnabled: StateFlow<Boolean> = FloatingStateHolder.isAutoHintEnabled
+    val isAutoClickerEnabled: StateFlow<Boolean> = FloatingStateHolder.isAutoClickerEnabled
     val lastActionMessage: StateFlow<String> = FloatingStateHolder.lastActionMessage
     val bubbleSizeDp: StateFlow<Int> = FloatingStateHolder.bubbleSizeDp
     val isHapticEnabled: StateFlow<Boolean> = FloatingStateHolder.isHapticEnabled
@@ -102,6 +103,10 @@ class FloatingViewModel : ViewModel() {
 
     fun toggleAutoHint() {
         FloatingStateHolder.toggleAutoHint()
+    }
+
+    fun toggleAutoClicker() {
+        FloatingStateHolder.toggleAutoClicker()
     }
 
     fun setBoardVerticalOffset(factor: Float) {
