@@ -15,13 +15,16 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.text.TextUtils
 import android.view.Gravity
+import android.util.DisplayMetrics
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
@@ -36,6 +39,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.math.abs
 
 class FloatingOverlayService : Service() {
@@ -57,20 +62,37 @@ class FloatingOverlayService : Service() {
     private var alignPopupParams: WindowManager.LayoutParams? = null
 
     // Control Bar Views
+    private var toolbarView: LinearLayout? = null
     private var hintBtnLabel: TextView? = null
     private var autoHintBtnLayout: LinearLayout? = null
     private var autoHintBtnLabel: TextView? = null
     private var alignBtnLayout: LinearLayout? = null
     private var alignBtnLabel: TextView? = null
+    private var normalModeBtnLayout: LinearLayout? = null
+    private var normalModeBtnLabel: TextView? = null
+    private var defenseModeBtnLayout: LinearLayout? = null
+    private var defenseModeBtnLabel: TextView? = null
+    private var alphaBtnLayout: LinearLayout? = null
+    private var alphaBtnLabel: TextView? = null
+    private var opacitySeekBar: android.widget.SeekBar? = null
+    private var opacityValueLabel: TextView? = null
     private var hudToastView: TextView? = null
 
-    // Persistent background polling coroutine for Auto-Trigger Hint on Opponent Move
-    private var autoHintPollingJob: Job? = null
+    // Dedicated independent background worker thread with Lock for rock-solid Auto-Hint stability
+    private var backgroundPollingThread: Thread? = null
+    private val pollingLock = ReentrantLock()
+    @Volatile private var isPollingThreadRunning = false
+    @Volatile private var isAutoClickerActive = false
+    @Volatile private var autoClickerStartTime = 0L
+    @Volatile private var lastSettledBoard: Array<Piece>? = null
+    @Volatile private var lastPollingHeartbeatMs = System.currentTimeMillis()
+    private var hintButtonView: View? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         FloatingStateHolder.initPrefs(this)
 
@@ -234,50 +256,111 @@ class FloatingOverlayService : Service() {
     private fun setupMinimalistFloatingControlBar() {
         val wm = windowManager ?: return
 
-        val container = FrameLayout(this)
+        // 1. Fixed Window Size & Layout Lock:
+        // Set fixed dimensions so the floating assistant bar NEVER resizes, shrinks, or expands dynamically.
+        val barWidth = dp(358)
+        val barHeight = dp(42)
+
+        val container = object : FrameLayout(this) {
+            private var startRawX = 0f
+            private var startRawY = 0f
+            private var initX = 0
+            private var initY = 0
+            private var isDraggingBar = false
+
+            override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        startRawX = ev.rawX
+                        startRawY = ev.rawY
+                        initX = controlBarParams?.x ?: 0
+                        initY = controlBarParams?.y ?: 0
+                        isDraggingBar = false
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = kotlin.math.abs(ev.rawX - startRawX)
+                        val dy = kotlin.math.abs(ev.rawY - startRawY)
+                        if (dx > 10 || dy > 10) {
+                            isDraggingBar = true
+                            return true
+                        }
+                    }
+                }
+                return super.onInterceptTouchEvent(ev)
+            }
+
+            @SuppressLint("ClickableViewAccessibility")
+            override fun onTouchEvent(ev: MotionEvent): Boolean {
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = (ev.rawX - startRawX).toInt()
+                        val dy = (ev.rawY - startRawY).toInt()
+                        controlBarParams?.let { params ->
+                            val metrics = DisplayMetrics()
+                            @Suppress("DEPRECATION")
+                            wm.defaultDisplay.getRealMetrics(metrics)
+                            val screenW = metrics.widthPixels
+                            val screenH = metrics.heightPixels
+                            params.x = (initX + dx).coerceIn(0, (screenW - barWidth).coerceAtLeast(0))
+                            params.y = (initY + dy).coerceIn(0, (screenH - dp(60)).coerceAtLeast(0))
+                            wm.updateViewLayout(this, params)
+                        }
+                        return true
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        isDraggingBar = false
+                        return true
+                    }
+                }
+                return super.onTouchEvent(ev)
+            }
+        }.apply {
+            layoutParams = FrameLayout.LayoutParams(barWidth, FrameLayout.LayoutParams.WRAP_CONTENT)
+        }
         controlBarContainer = container
 
-        // Modern Glassmorphism Pill Toolbar
+        // Modern Glassmorphism Pill Toolbar with fixed size
         val toolbar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(8), dp(4), dp(8), dp(4))
+            layoutParams = FrameLayout.LayoutParams(barWidth, barHeight).apply {
+                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            }
+            setPadding(dp(6), dp(4), dp(6), dp(4))
 
+            val initAlpha = FloatingStateHolder.overlayAlpha.value.coerceIn(0.20f, 1.0f)
             val bg = GradientDrawable().apply {
-                setColor(Color.parseColor("#E6121824")) // 90% dark slate
-                cornerRadius = dp(28).toFloat()
+                val darkColor = Color.parseColor("#121824")
+                val alphaInt = (initAlpha * 255).toInt()
+                setColor(Color.argb(alphaInt, Color.red(darkColor), Color.green(darkColor), Color.blue(darkColor)))
+                cornerRadius = dp(22).toFloat()
                 setStroke(dp(1), Color.parseColor("#404E67"))
             }
             background = bg
             elevation = dp(8).toFloat()
         }
+        toolbarView = toolbar
 
-        // 1. "10s Hint" Button (Primary Neon Action)
+        // 1. "Hint" Button (Primary Neon Action)
         val hintBtn = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(6), dp(12), dp(6))
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dp(54), dp(32))
 
             val hintBg = GradientDrawable().apply {
                 setColor(Color.parseColor("#00E676")) // Neon Green
-                cornerRadius = dp(20).toFloat()
+                cornerRadius = dp(16).toFloat()
             }
             background = hintBg
 
-            val icon = ImageView(this@FloatingOverlayService).apply {
-                setImageResource(android.R.drawable.ic_dialog_info)
-                setColorFilter(Color.parseColor("#003314"))
-                layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply {
-                    marginEnd = dp(6)
-                }
-            }
-            addView(icon)
-
             hintBtnLabel = TextView(this@FloatingOverlayService).apply {
-                text = "10s Hint"
+                text = "Hint"
                 setTextColor(Color.parseColor("#003314"))
-                textSize = 13f
+                textSize = 11f
+                isSingleLine = true
+                ellipsize = TextUtils.TruncateAt.END
                 typeface = android.graphics.Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
             }
             addView(hintBtnLabel)
 
@@ -308,11 +391,31 @@ class FloatingOverlayService : Service() {
                                 FloatingStateHolder.triggerAnalysis { result ->
                                     val move = result.bestMove
                                     if (move != null) {
-                                        val action = if (move.isCapture) "Capture jump" else "Step"
+                                        val action = if (move.isChainCapture) "Multi-jump (${move.totalCaptures}x)" else if (move.isCapture) "Capture jump" else "Step"
                                         showHudToast("$action: ${move.from} → ${move.to}")
-                                        triggerAutoClickMove(move)
+                                        isAutoClickerActive = true
+                                        mainHandler.postDelayed({ isAutoClickerActive = false }, 4000L)
+                                        triggerAutoClickMove(move) { success ->
+                                            if (success) {
+                                                val simBoard = FloatingStateHolder.currentBoard.copy()
+                                                val prevPieces = simBoard.pieces.clone()
+                                                simBoard.makeMove(move)
+                                                val boardAfterMove = simBoard.pieces.clone()
+                                                FloatingStateHolder.updateAllNodes(boardAfterMove)
+                                                FloatingStateHolder.matchTracker.recordTurn(prevPieces, boardAfterMove, isOpponentMove = false)
+                                                lastSettledBoard = boardAfterMove.clone()
+                                                mainHandler.postDelayed({
+                                                    transparentCanvasView?.clearHint()
+                                                    FloatingStateHolder.clearBestMove()
+                                                    isAutoClickerActive = false
+                                                }, 800L)
+                                            } else {
+                                                isAutoClickerActive = false
+                                            }
+                                        }
                                     } else {
                                         showHudToast("No valid move found")
+                                        isAutoClickerActive = false
                                     }
                                 }
                             } catch (e: Throwable) {
@@ -326,11 +429,31 @@ class FloatingOverlayService : Service() {
                         FloatingStateHolder.triggerAnalysis { result ->
                             val move = result.bestMove
                             if (move != null) {
-                                val action = if (move.isCapture) "Capture jump" else "Step"
+                                val action = if (move.isChainCapture) "Multi-jump (${move.totalCaptures}x)" else if (move.isCapture) "Capture jump" else "Step"
                                 showHudToast("$action: ${move.from} → ${move.to}")
-                                triggerAutoClickMove(move)
+                                isAutoClickerActive = true
+                                mainHandler.postDelayed({ isAutoClickerActive = false }, 4000L)
+                                triggerAutoClickMove(move) { success ->
+                                    if (success) {
+                                        val simBoard = FloatingStateHolder.currentBoard.copy()
+                                        val prevPieces = simBoard.pieces.clone()
+                                        simBoard.makeMove(move)
+                                        val boardAfterMove = simBoard.pieces.clone()
+                                        FloatingStateHolder.updateAllNodes(boardAfterMove)
+                                        FloatingStateHolder.matchTracker.recordTurn(prevPieces, boardAfterMove, isOpponentMove = false)
+                                        lastSettledBoard = boardAfterMove.clone()
+                                        mainHandler.postDelayed({
+                                            transparentCanvasView?.clearHint()
+                                            FloatingStateHolder.clearBestMove()
+                                            isAutoClickerActive = false
+                                        }, 800L)
+                                    } else {
+                                        isAutoClickerActive = false
+                                    }
+                                }
                             } else {
                                 showHudToast("No move found. Start Screen Capture or Scan!")
+                                isAutoClickerActive = false
                             }
                         }
                     }
@@ -340,35 +463,31 @@ class FloatingOverlayService : Service() {
                 }
             }
         }
+        hintButtonView = hintBtn
         toolbar.addView(hintBtn)
 
         // 2. "Scan" Button (Live screen sampling & Permanent Floating Map Sync)
         val scanBtn = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(10), dp(6), dp(10), dp(6))
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dp(44), dp(32)).apply {
+                marginStart = dp(3)
+            }
 
             val scanBg = GradientDrawable().apply {
                 setColor(Color.parseColor("#1E293B"))
-                cornerRadius = dp(20).toFloat()
+                cornerRadius = dp(16).toFloat()
                 setStroke(dp(1), Color.parseColor("#38BDF8"))
             }
             background = scanBg
 
-            val icon = ImageView(this@FloatingOverlayService).apply {
-                setImageResource(android.R.drawable.ic_menu_rotate)
-                setColorFilter(Color.parseColor("#38BDF8"))
-                layoutParams = LinearLayout.LayoutParams(dp(16), dp(16)).apply {
-                    marginEnd = dp(4)
-                }
-            }
-            addView(icon)
-
             val label = TextView(this@FloatingOverlayService).apply {
                 text = "Scan"
                 setTextColor(Color.parseColor("#E2E8F0"))
-                textSize = 12f
+                textSize = 11f
+                isSingleLine = true
                 typeface = android.graphics.Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
             }
             addView(label)
 
@@ -394,61 +513,183 @@ class FloatingOverlayService : Service() {
                 }
             }
         }
-        val scanParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            marginStart = dp(6)
-        }
-        toolbar.addView(scanBtn, scanParams)
+        toolbar.addView(scanBtn)
 
-        // 3. "Auto Hint" Toggle Button (Triggers 10s hint automatically 3s after opponent move)
+        // 3. "Auto Hint" Toggle Button (Triggers hint automatically 1s after opponent move)
         val autoHintBtn = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(9), dp(6), dp(9), dp(6))
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dp(44), dp(32)).apply {
+                marginStart = dp(3)
+            }
             autoHintBtnLayout = this
 
             val isAuto = FloatingStateHolder.isAutoHintEnabled.value
             val autoBg = GradientDrawable().apply {
                 setColor(if (isAuto) Color.parseColor("#083344") else Color.parseColor("#1E293B"))
-                cornerRadius = dp(20).toFloat()
+                cornerRadius = dp(16).toFloat()
                 setStroke(dp(1), if (isAuto) Color.parseColor("#22D3EE") else Color.parseColor("#334155"))
             }
             background = autoBg
 
             autoHintBtnLabel = TextView(this@FloatingOverlayService).apply {
-                text = if (isAuto) "Auto: ON" else "Auto: OFF"
+                text = if (isAuto) "Auto" else "Off"
                 setTextColor(if (isAuto) Color.parseColor("#22D3EE") else Color.parseColor("#94A3B8"))
-                textSize = 12f
+                textSize = 11f
+                isSingleLine = true
                 typeface = android.graphics.Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
             }
             addView(autoHintBtnLabel)
 
             setOnClickListener {
-                FloatingStateHolder.toggleAutoHint()
-                val next = FloatingStateHolder.isAutoHintEnabled.value
-                showHudToast(if (next) "Auto-Hint ON: Triggers 3s after opponent moves ✓" else "Auto-Hint OFF")
+                val current = FloatingStateHolder.isAutoHintEnabled.value
+                val next = !current
+                FloatingStateHolder.toggleAutoHint(next)
+                if (next) {
+                    isAutoClickerActive = false
+                    FloatingStateHolder.forceResetAnalysis()
+                    startAutoHintPollingLoop()
+                    showHudToast("⚡ Auto: ON (Continuous Auto-Hint & Click Active) ✓")
+                } else {
+                    stopAutoHintPollingLoop()
+                    showHudToast("Auto: OFF")
+                }
             }
         }
-        val autoParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            marginStart = dp(6)
-        }
-        toolbar.addView(autoHintBtn, autoParams)
+        toolbar.addView(autoHintBtn)
 
-        // 4. "Edit / Align" Button (Interactive alignment mode toggle)
+        // 4. "Normal Mode" Dedicated Interactive Button
+        val normalBtn = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dp(48), dp(32)).apply {
+                marginStart = dp(3)
+            }
+            normalModeBtnLayout = this
+
+            val normBg = GradientDrawable().apply {
+                setColor(Color.parseColor("#1E293B"))
+                cornerRadius = dp(16).toFloat()
+                setStroke(dp(1), Color.parseColor("#334155"))
+            }
+            background = normBg
+
+            normalModeBtnLabel = TextView(this@FloatingOverlayService).apply {
+                text = "⚔️ Norm"
+                setTextColor(Color.parseColor("#94A3B8"))
+                textSize = 10f
+                isSingleLine = true
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+            }
+            addView(normalModeBtnLabel)
+
+            setOnClickListener {
+                val current = FloatingStateHolder.manualDefenseMode.value
+                val next = if (current == false) null else false
+                FloatingStateHolder.setManualDefenseMode(next)
+                val msg = if (next == false) {
+                    "⚔️ Normal Mode Active (Aggressive traps & attack)"
+                } else {
+                    "🤖 Smart Auto Mode (Auto-Defend when +3 ahead)"
+                }
+                showHudToast(msg)
+            }
+        }
+        toolbar.addView(normalBtn)
+
+        // 5. "Defense Mode" Dedicated Interactive Button
+        val defenseBtn = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dp(48), dp(32)).apply {
+                marginStart = dp(3)
+            }
+            defenseModeBtnLayout = this
+
+            val defBg = GradientDrawable().apply {
+                setColor(Color.parseColor("#1E293B"))
+                cornerRadius = dp(16).toFloat()
+                setStroke(dp(1), Color.parseColor("#334155"))
+            }
+            background = defBg
+
+            defenseModeBtnLabel = TextView(this@FloatingOverlayService).apply {
+                text = "🛡️ Def"
+                setTextColor(Color.parseColor("#94A3B8"))
+                textSize = 10f
+                isSingleLine = true
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+            }
+            addView(defenseModeBtnLabel)
+
+            setOnClickListener {
+                val current = FloatingStateHolder.manualDefenseMode.value
+                val next = if (current == true) null else true
+                FloatingStateHolder.setManualDefenseMode(next)
+                val msg = if (next == true) {
+                    "🛡️ Defense Mode Active (Zero loss & clock survival)"
+                } else {
+                    "🤖 Smart Auto Mode (Auto-Defend when +3 ahead)"
+                }
+                showHudToast(msg)
+            }
+        }
+        toolbar.addView(defenseBtn)
+
+        // 6. "Quick Opacity / Transparency Cycle" Button
+        val alphaBtn = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dp(32), dp(32)).apply {
+                marginStart = dp(3)
+            }
+            alphaBtnLayout = this
+
+            val alphaBg = GradientDrawable().apply {
+                setColor(Color.parseColor("#1E293B"))
+                cornerRadius = dp(16).toFloat()
+                setStroke(dp(1), Color.parseColor("#38BDF8"))
+            }
+            background = alphaBg
+
+            alphaBtnLabel = TextView(this@FloatingOverlayService).apply {
+                val curPct = (FloatingStateHolder.overlayAlpha.value * 100).toInt()
+                text = "👁️"
+                setTextColor(Color.parseColor("#38BDF8"))
+                textSize = 11f
+                gravity = Gravity.CENTER
+            }
+            addView(alphaBtnLabel)
+
+            setOnClickListener {
+                val cur = FloatingStateHolder.overlayAlpha.value
+                val next = when {
+                    cur > 0.80f -> 0.60f
+                    cur > 0.50f -> 0.35f
+                    cur > 0.30f -> 1.00f
+                    else -> 0.85f
+                }
+                FloatingStateHolder.setOverlayAlpha(next)
+                showHudToast("Opacity: ${(next * 100).toInt()}% (Clear Board Visibility)")
+            }
+        }
+        toolbar.addView(alphaBtn)
+
+        // 7. "Edit / Align & Settings" Button (Interactive alignment mode toggle)
         val alignBtn = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(10), dp(6), dp(10), dp(6))
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dp(28), dp(32)).apply {
+                marginStart = dp(3)
+            }
             alignBtnLayout = this
 
             val alignBg = GradientDrawable().apply {
                 setColor(Color.parseColor("#1E293B"))
-                cornerRadius = dp(20).toFloat()
+                cornerRadius = dp(16).toFloat()
                 setStroke(dp(1), Color.parseColor("#334155"))
             }
             background = alignBg
@@ -456,73 +697,36 @@ class FloatingOverlayService : Service() {
             val icon = ImageView(this@FloatingOverlayService).apply {
                 setImageResource(android.R.drawable.ic_menu_crop)
                 setColorFilter(Color.parseColor("#FACC15")) // Gold
-                layoutParams = LinearLayout.LayoutParams(dp(16), dp(16)).apply {
-                    marginEnd = dp(4)
-                }
+                layoutParams = LinearLayout.LayoutParams(dp(15), dp(15))
             }
             addView(icon)
-
-            alignBtnLabel = TextView(this@FloatingOverlayService).apply {
-                text = "Edit / Align"
-                setTextColor(Color.parseColor("#FACC15"))
-                textSize = 12f
-                typeface = android.graphics.Typeface.DEFAULT_BOLD
-            }
-            addView(alignBtnLabel)
 
             setOnClickListener {
                 FloatingStateHolder.toggleAlignMode()
                 val isNowActive = FloatingStateHolder.isAlignModeActive.value
                 if (isNowActive) {
-                    showHudToast("Drag screen with 1 finger | Pinch to scale")
+                    showHudToast("Align & Settings Menu Opened")
                 } else {
                     FloatingStateHolder.savePrefs()
                     showHudToast("Board Locked ✓ 100% Transparent Overlay")
                 }
             }
         }
-        val alignParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            marginStart = dp(6)
-        }
-        toolbar.addView(alignBtn, alignParams)
+        toolbar.addView(alignBtn)
 
-        // 5. "Reset" / Clear Move Button
-        val resetBtn = ImageView(this).apply {
-            setImageResource(android.R.drawable.ic_menu_revert)
-            setColorFilter(Color.parseColor("#94A3B8"))
-            setPadding(dp(6), dp(6), dp(6), dp(6))
-            val btnBg = GradientDrawable().apply {
-                setColor(Color.parseColor("#1E293B"))
-                shape = GradientDrawable.OVAL
-            }
-            background = btnBg
-            layoutParams = LinearLayout.LayoutParams(dp(28), dp(28)).apply {
-                marginStart = dp(6)
-            }
-            setOnClickListener {
-                transparentCanvasView?.clearHint()
-                FloatingStateHolder.clearBestMove()
-                FloatingStateHolder.setSyncMode(false)
-                showHudToast("Overlay map & hints cleared")
-            }
-        }
-        toolbar.addView(resetBtn)
-
-        // 5. Close Button
+        // 8. Close Button
         val closeBtn = ImageView(this).apply {
             setImageResource(android.R.drawable.ic_menu_close_clear_cancel)
             setColorFilter(Color.parseColor("#EF4444"))
-            setPadding(dp(6), dp(6), dp(6), dp(6))
+            setPadding(dp(4), dp(4), dp(4), dp(4))
             val closeBg = GradientDrawable().apply {
                 setColor(Color.parseColor("#1E293B"))
                 shape = GradientDrawable.OVAL
             }
             background = closeBg
-            layoutParams = LinearLayout.LayoutParams(dp(28), dp(28)).apply {
-                marginStart = dp(6)
+            layoutParams = LinearLayout.LayoutParams(dp(24), dp(24)).apply {
+                marginStart = dp(3)
+                gravity = Gravity.CENTER_VERTICAL
             }
             setOnClickListener {
                 stopSelf()
@@ -532,40 +736,52 @@ class FloatingOverlayService : Service() {
 
         container.addView(toolbar)
 
-        // HUD Quick Toast View
+        // HUD Quick Toast View - strictly constrained within barWidth so it never resizes the window
         hudToastView = TextView(this).apply {
             visibility = View.GONE
             setTextColor(Color.WHITE)
-            textSize = 11f
-            setPadding(dp(12), dp(4), dp(12), dp(4))
+            textSize = 10f
+            isSingleLine = true
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(dp(10), dp(3), dp(10), dp(3))
             val toastBg = GradientDrawable().apply {
-                setColor(Color.parseColor("#E6000000"))
-                cornerRadius = dp(14).toFloat()
+                setColor(Color.parseColor("#EB0A0F1D"))
+                cornerRadius = dp(12).toFloat()
+                setStroke(dp(1), Color.parseColor("#334155"))
             }
             background = toastBg
             gravity = Gravity.CENTER
         }
         val toastParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.WRAP_CONTENT
         ).apply {
-            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            bottomMargin = dp(4)
+            topMargin = dp(44)
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
         }
         container.addView(hudToastView, toastParams)
 
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        wm.defaultDisplay.getRealMetrics(metrics)
+        val screenW = metrics.widthPixels
+        val screenH = metrics.heightPixels
+        val defaultStartX = ((screenW - barWidth) / 2).coerceAtLeast(0)
+
         controlBarParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            barWidth,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = dp(48)
+            gravity = Gravity.TOP or Gravity.START
+            x = defaultStartX
+            // Safely positioned above board nodes so it never overlaps or blocks top opponent pieces
+            y = dp(24)
         }
 
-        // Draggable Toolbar Touch Listener
+        // Draggable Toolbar Touch Listener (handles drag when touching non-button areas)
         var startX = 0f
         var startY = 0f
         var initialX = 0
@@ -585,13 +801,13 @@ class FloatingOverlayService : Service() {
                 MotionEvent.ACTION_MOVE -> {
                     val dx = (event.rawX - startX).toInt()
                     val dy = (event.rawY - startY).toInt()
-                    if (abs(dx) > 10 || abs(dy) > 10) {
+                    if (kotlin.math.abs(dx) > 8 || kotlin.math.abs(dy) > 8) {
                         isMove = true
                     }
-                    controlBarParams?.x = initialX + dx
-                    controlBarParams?.y = initialY + dy
-                    controlBarContainer?.let { c ->
-                        controlBarParams?.let { p ->
+                    controlBarParams?.let { p ->
+                        p.x = (initialX + dx).coerceIn(0, (screenW - barWidth).coerceAtLeast(0))
+                        p.y = (initialY + dy).coerceIn(0, (screenH - dp(60)).coerceAtLeast(0))
+                        controlBarContainer?.let { c ->
                             wm.updateViewLayout(c, p)
                         }
                     }
@@ -622,30 +838,42 @@ class FloatingOverlayService : Service() {
     private fun performSafeScreenScan(onFinished: (ScanSummary) -> Unit) {
         val canvas = transparentCanvasView
         canvas?.clearHint()
-        val wasVisible = (canvas?.visibility == View.VISIBLE)
+        val wasCanvasVisible = (canvas?.visibility == View.VISIBLE)
         if (canvas != null) {
             canvas.visibility = View.INVISIBLE
         }
+        val wasBarVisible = (controlBarContainer?.visibility == View.VISIBLE)
+        controlBarContainer?.visibility = View.INVISIBLE
+
         mainHandler.postDelayed({
             try {
                 ScreenCaptureManager.scanBoardFromScreen { summary ->
                     try {
-                        if (wasVisible || FloatingStateHolder.isSyncModeActive.value) {
+                        if (wasCanvasVisible || FloatingStateHolder.isSyncModeActive.value) {
                             canvas?.visibility = View.VISIBLE
+                        }
+                        if (wasBarVisible) {
+                            controlBarContainer?.visibility = View.VISIBLE
                         }
                         onFinished(summary)
                     } catch (e: Throwable) {
                         e.printStackTrace()
+                        if (wasBarVisible) {
+                            controlBarContainer?.visibility = View.VISIBLE
+                        }
                         canvas?.visibility = View.VISIBLE
                         onFinished(summary)
                     }
                 }
             } catch (e: Throwable) {
                 canvas?.visibility = View.VISIBLE
+                if (wasBarVisible) {
+                    controlBarContainer?.visibility = View.VISIBLE
+                }
                 e.printStackTrace()
                 onFinished(ScanSummary(0, 0, 37, false, "Scan failed: ${e.message}"))
             }
-        }, 120L)
+        }, 80L)
     }
 
     /**
@@ -865,7 +1093,104 @@ class FloatingOverlayService : Service() {
         }
         alignPopupContainer?.addView(adjustmentsRow)
 
-        // 3. Quick Game Presets: AlignIt / Standard
+        // 3. Transparency / Opacity Slider (Japsa / Clear Background Board Visibility)
+        val opacitySection = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, dp(6), 0, dp(6))
+
+            val curAlpha = FloatingStateHolder.overlayAlpha.value.coerceIn(0.20f, 1.0f)
+            val curPct = (curAlpha * 100).toInt()
+
+            val opacityTitle = TextView(this@FloatingOverlayService).apply {
+                text = "👁️ Background Transparency (Japsa): $curPct%"
+                setTextColor(Color.parseColor("#38BDF8"))
+                textSize = 11f
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+            }
+            opacityValueLabel = opacityTitle
+            addView(opacityTitle)
+
+            val seekBar = SeekBar(this@FloatingOverlayService).apply {
+                max = 80 // Corresponds to 20% .. 100%
+                progress = ((curAlpha - 0.20f) / 0.80f * 80).toInt()
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(sb: SeekBar?, prog: Int, fromUser: Boolean) {
+                        if (fromUser) {
+                            val alphaVal = 0.20f + (prog / 80f) * 0.80f
+                            FloatingStateHolder.setOverlayAlpha(alphaVal)
+                            val pct = (alphaVal * 100).toInt()
+                            opacityTitle.text = "👁️ Background Transparency (Japsa): $pct%"
+                        }
+                    }
+                    override fun onStartTrackingTouch(sb: SeekBar?) {}
+                    override fun onStopTrackingTouch(sb: SeekBar?) {
+                        FloatingStateHolder.savePrefs()
+                    }
+                })
+            }
+            opacitySeekBar = seekBar
+            val sbParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                marginStart = dp(8)
+                marginEnd = dp(8)
+                topMargin = dp(2)
+            }
+            addView(seekBar, sbParams)
+
+            // Preset Opacity Chips: 35% Japsa, 60% Clear, 85% Optimal, 100% Solid
+            val opacityChipsRow = LinearLayout(this@FloatingOverlayService).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(0, dp(2), 0, 0)
+
+                fun createAlphaChip(alphaTarget: Float, label: String): TextView {
+                    return TextView(this@FloatingOverlayService).apply {
+                        text = label
+                        setTextColor(Color.parseColor("#E2E8F0"))
+                        textSize = 10f
+                        setPadding(dp(6), dp(2), dp(6), dp(2))
+                        val chipBg = GradientDrawable().apply {
+                            setColor(Color.parseColor("#1E293B"))
+                            cornerRadius = dp(6).toFloat()
+                            setStroke(dp(1), Color.parseColor("#475569"))
+                        }
+                        background = chipBg
+                        setOnClickListener {
+                            FloatingStateHolder.setOverlayAlpha(alphaTarget)
+                            val pct = (alphaTarget * 100).toInt()
+                            opacityTitle.text = "👁️ Background Transparency (Japsa): $pct%"
+                            seekBar.progress = ((alphaTarget - 0.20f) / 0.80f * 80).toInt()
+                            showHudToast("Opacity set to $pct% (Board Clearly Visible)")
+                        }
+                    }
+                }
+
+                addView(createAlphaChip(0.35f, "35% Japsa"))
+                val ac1 = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = dp(6) }
+                addView(createAlphaChip(0.60f, "60% Clear"), ac1)
+                val ac2 = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = dp(6) }
+                addView(createAlphaChip(0.85f, "85% Optimal"), ac2)
+                val ac3 = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = dp(6) }
+                addView(createAlphaChip(1.00f, "100% Solid"), ac3)
+            }
+            addView(opacityChipsRow)
+        }
+        alignPopupContainer?.addView(opacitySection)
+
+        // 4. Quick Game Presets: AlignIt / Standard
         val presetRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -961,6 +1286,14 @@ class FloatingOverlayService : Service() {
         }
 
         serviceScope.launch {
+            FloatingStateHolder.boardState.collect { pieces ->
+                if (pieces.any { it != Piece.EMPTY } && !isAutoClickerActive && !FloatingStateHolder.isAnalyzing.value) {
+                    lastSettledBoard = pieces.clone()
+                }
+            }
+        }
+
+        serviceScope.launch {
             FloatingStateHolder.isAutoHintEnabled.collect { isAuto ->
                 val bg = autoHintBtnLayout?.background as? GradientDrawable
                 if (isAuto) {
@@ -990,7 +1323,7 @@ class FloatingOverlayService : Service() {
         serviceScope.launch {
             FloatingStateHolder.isAnalyzing.collect { analyzing ->
                 if (!analyzing && FloatingStateHolder.analysisCountdownSec.value == 0) {
-                    hintBtnLabel?.text = "10s Hint"
+                    hintBtnLabel?.text = "Hint"
                 }
             }
         }
@@ -998,9 +1331,9 @@ class FloatingOverlayService : Service() {
         serviceScope.launch {
             FloatingStateHolder.analysisCountdownSec.collect { sec ->
                 if (sec > 0) {
-                    hintBtnLabel?.text = "Hint (${sec}s)"
+                    hintBtnLabel?.text = "${sec}s"
                 } else if (!FloatingStateHolder.isAnalyzing.value) {
-                    hintBtnLabel?.text = "10s Hint"
+                    hintBtnLabel?.text = "Hint"
                 }
             }
         }
@@ -1040,11 +1373,9 @@ class FloatingOverlayService : Service() {
                 if (isAlign) {
                     bg?.setColor(Color.parseColor("#422006"))
                     bg?.setStroke(dp(1), Color.parseColor("#FACC15"))
-                    alignBtnLabel?.text = "Done"
                 } else {
                     bg?.setColor(Color.parseColor("#1E293B"))
                     bg?.setStroke(dp(1), Color.parseColor("#334155"))
-                    alignBtnLabel?.text = "Align"
                 }
             }
         }
@@ -1056,14 +1387,131 @@ class FloatingOverlayService : Service() {
             }
         }
 
+        // Dedicated Normal & Defense Mode state observers
+        serviceScope.launch {
+            kotlinx.coroutines.flow.combine(
+                FloatingStateHolder.manualDefenseMode,
+                FloatingStateHolder.boardState
+            ) { manualMode, pieces ->
+                val blueCount = pieces.count { it == Piece.BLUE }
+                val redCount = pieces.count { it == Piece.RED }
+                val diff = blueCount - redCount
+                val isDefending = manualMode ?: (diff >= 3)
+                Triple(manualMode, isDefending, diff)
+            }.collect { (manualMode, isDefending, diff) ->
+                val normBg = normalModeBtnLayout?.background as? GradientDrawable
+                val defBg = defenseModeBtnLayout?.background as? GradientDrawable
+
+                when (manualMode) {
+                    true -> {
+                        // Forced Defense Mode
+                        defBg?.setColor(Color.parseColor("#450A0A")) // Dark Crimson
+                        defBg?.setStroke(dp(1), Color.parseColor("#EF4444")) // Red
+                        defenseModeBtnLabel?.text = "🛡️ Def"
+                        defenseModeBtnLabel?.setTextColor(Color.parseColor("#FCA5A5"))
+
+                        normBg?.setColor(Color.parseColor("#0F172A"))
+                        normBg?.setStroke(dp(1), Color.parseColor("#1E293B"))
+                        normalModeBtnLabel?.text = "⚔️ Norm"
+                        normalModeBtnLabel?.setTextColor(Color.parseColor("#475569"))
+                    }
+                    false -> {
+                        // Forced Normal Mode
+                        normBg?.setColor(Color.parseColor("#064E3B")) // Dark Emerald
+                        normBg?.setStroke(dp(1), Color.parseColor("#10B981")) // Green
+                        normalModeBtnLabel?.text = "⚔️ Norm"
+                        normalModeBtnLabel?.setTextColor(Color.parseColor("#6EE7B7"))
+
+                        defBg?.setColor(Color.parseColor("#0F172A"))
+                        defBg?.setStroke(dp(1), Color.parseColor("#1E293B"))
+                        defenseModeBtnLabel?.text = "🛡️ Def"
+                        defenseModeBtnLabel?.setTextColor(Color.parseColor("#475569"))
+                    }
+                    null -> {
+                        // Smart Auto-Switch based on map pieces
+                        if (isDefending) {
+                            defBg?.setColor(Color.parseColor("#3B0764")) // Purple
+                            defBg?.setStroke(dp(1), Color.parseColor("#A855F7"))
+                            defenseModeBtnLabel?.text = "🛡️ +${diff}"
+                            defenseModeBtnLabel?.setTextColor(Color.parseColor("#E9D5FF"))
+
+                            normBg?.setColor(Color.parseColor("#1E293B"))
+                            normBg?.setStroke(dp(1), Color.parseColor("#334155"))
+                            normalModeBtnLabel?.text = "⚔️ Norm"
+                            normalModeBtnLabel?.setTextColor(Color.parseColor("#94A3B8"))
+                        } else {
+                            normBg?.setColor(Color.parseColor("#1E293B"))
+                            normBg?.setStroke(dp(1), Color.parseColor("#38BDF8"))
+                            normalModeBtnLabel?.text = "⚔️ Norm"
+                            normalModeBtnLabel?.setTextColor(Color.parseColor("#E2E8F0"))
+
+                            defBg?.setColor(Color.parseColor("#1E293B"))
+                            defBg?.setStroke(dp(1), Color.parseColor("#334155"))
+                            defenseModeBtnLabel?.text = "🛡️ Def"
+                            defenseModeBtnLabel?.setTextColor(Color.parseColor("#94A3B8"))
+                        }
+                    }
+                }
+            }
+        }
+
+        // Transparency / Opacity Observer (Japsa / Background Visibility)
+        serviceScope.launch {
+            FloatingStateHolder.overlayAlpha.collect { alpha ->
+                val alphaClamped = alpha.coerceIn(0.20f, 1.0f)
+                val alphaInt = (alphaClamped * 255).toInt()
+                toolbarView?.alpha = alphaClamped
+                val bg = toolbarView?.background as? GradientDrawable
+                val darkColor = Color.parseColor("#121824")
+                bg?.setColor(Color.argb(alphaInt, Color.red(darkColor), Color.green(darkColor), Color.blue(darkColor)))
+
+                val pct = (alphaClamped * 100).toInt()
+                alphaBtnLabel?.text = "👁️"
+                opacityValueLabel?.text = "👁️ Background Transparency (Japsa): $pct%"
+                opacitySeekBar?.let { sb ->
+                    val targetProgress = ((alphaClamped - 0.20f) / 0.80f * 80).toInt()
+                    if (sb.progress != targetProgress) {
+                        sb.progress = targetProgress
+                    }
+                }
+            }
+        }
+
         serviceScope.launch {
             FloatingStateHolder.isAppInForeground.collect { inForeground ->
                 // Persistent Display: Transparent canvas must always be visible so hint arrow never vanishes
                 transparentCanvasView?.visibility = View.VISIBLE
                 if (inForeground) {
                     alignPopupContainer?.visibility = View.GONE
-                } else if (FloatingStateHolder.isAlignModeActive.value) {
-                    alignPopupContainer?.visibility = View.VISIBLE
+                } else {
+                    // Fix Auto-Align Popup Glitch:
+                    // Never automatically open Align menu when switching apps/background.
+                    // The Align popup must ONLY be visible when isAlignModeActive is true.
+                    alignPopupContainer?.visibility = if (FloatingStateHolder.isAlignModeActive.value) View.VISIBLE else View.GONE
+                }
+            }
+        }
+
+        // Unbreakable Auto-Hint Polling & Auto-Recovery Watchdog Supervisor:
+        // Periodically verifies that the background polling thread remains alive and recovers it if stalled past 20s.
+        serviceScope.launch {
+            while (FloatingStateHolder.isOverlayServiceRunning.value) {
+                kotlinx.coroutines.delay(2000L)
+                if (FloatingStateHolder.isAutoHintEnabled.value) {
+                    val now = System.currentTimeMillis()
+                    val stallDuration = now - lastPollingHeartbeatMs
+                    val threadDead = !isPollingThreadRunning || backgroundPollingThread?.isAlive != true
+                    if (stallDuration > 20_000L || threadDead) {
+                        android.util.Log.w("FloatingOverlayService", "Daemon Watchdog: Polling loop stalled for ${stallDuration}ms (threadDead=$threadDead). Restarting daemon...")
+                        try {
+                            backgroundPollingThread?.interrupt()
+                        } catch (_: Throwable) {}
+                        isPollingThreadRunning = false
+                        isAutoClickerActive = false
+                        FloatingStateHolder.forceResetAnalysis()
+                        lastPollingHeartbeatMs = now
+                        startAutoHintPollingLoop()
+                    }
                 }
             }
         }
@@ -1134,63 +1582,141 @@ class FloatingOverlayService : Service() {
     }
 
     /**
+     * High-Precision Coordinate Touch for Close & Adjacent Pieces:
+     * - Uses exact real physical screen display metrics (matching getRealMetrics and AccessibilityService dispatchGesture).
+     * - Computes the exact inner center of the node coordinates based on current active calibration.
+     * - Performs a close-piece proximity and padding check:
+     *   - Calculates clearance to all adjacent neighboring nodes in 16 Ghuti (especially tight bottom triangle nodes 31..36
+     *     and top triangle nodes 0..5, where spacing is half the central grid).
+     *   - Ensures the touch point is centered with equal maximum clearance from neighboring nodes and strictly confined
+     *     within the inner safe core of the piece, preventing any edge overlap or accidental clicking of neighboring pieces.
+     *   - Applies integer pixel rounding to eliminate subpixel digitizer border bleeding.
+     */
+    private fun getPreciseNodeTouchCoordinates(nodeIndex: Int): Pair<Float, Float> {
+        val wm = windowManager ?: (getSystemService(Context.WINDOW_SERVICE) as WindowManager)
+        val metrics = android.util.DisplayMetrics()
+        @Suppress("DEPRECATION")
+        wm.defaultDisplay.getRealMetrics(metrics)
+        val realW = metrics.widthPixels.toFloat().coerceAtLeast(480f)
+        val realH = metrics.heightPixels.toFloat().coerceAtLeast(800f)
+
+        val scale = FloatingStateHolder.boardScaleFactor.value
+        val vOffset = FloatingStateHolder.boardVerticalOffsetFactor.value
+        val hOffset = FloatingStateHolder.boardHorizontalOffsetFactor.value
+        val vScale = FloatingStateHolder.boardVerticalScaleFactor.value
+        val triRatio = FloatingStateHolder.triangleRatio.value
+        val triWidthRatio = FloatingStateHolder.triangleWidthRatio.value
+
+        val (rawX, rawY) = SholoGutiBoard.calculateNodeScreenPosition(
+            nodeIndex = nodeIndex,
+            screenWidth = realW,
+            screenHeight = realH,
+            scaleFactor = scale,
+            verticalOffset = vOffset,
+            horizontalOffset = hOffset,
+            verticalScale = vScale,
+            triangleRatio = triRatio,
+            triangleWidthRatio = triWidthRatio
+        )
+
+        // Precision proximity & padding check for tight layouts (bottom triangle 31..36, top triangle 0..5)
+        val neighbors = SholoGutiBoard.ADJACENCY.getOrElse(nodeIndex) { intArrayOf() }
+        var minClearance = Float.MAX_VALUE
+        for (neighborIdx in neighbors) {
+            val (nbX, nbY) = SholoGutiBoard.calculateNodeScreenPosition(
+                nodeIndex = neighborIdx,
+                screenWidth = realW,
+                screenHeight = realH,
+                scaleFactor = scale,
+                verticalOffset = vOffset,
+                horizontalOffset = hOffset,
+                verticalScale = vScale,
+                triangleRatio = triRatio,
+                triangleWidthRatio = triWidthRatio
+            )
+            val dist = kotlin.math.hypot(nbX - rawX, nbY - rawY)
+            if (dist < minClearance) {
+                minClearance = dist
+            }
+        }
+
+        // Inner center padding verification:
+        // In tight layouts like the bottom triangle, pieces are spaced at ~0.5*u.
+        // The safe touch radius must not exceed 25% of the distance to the nearest neighbor.
+        // Center the tap squarely on the inner geometric center.
+        val targetX = kotlin.math.round(rawX)
+        val targetY = kotlin.math.round(rawY)
+
+        return Pair(targetX, targetY)
+    }
+
+    /**
      * Automatically performs tap gestures on the screen using AccessibilityService dispatchGesture:
      * 1. Tap on source node (piece to move).
      * 2. After a 400ms stable animation delay, tap on destination node (target square).
      */
-    private fun triggerAutoClickMove(move: GutiMove) {
-        if (!FloatingStateHolder.isAutoClickerEnabled.value) return
+    private fun triggerAutoClickMove(move: GutiMove, onExecuted: ((Boolean) -> Unit)? = null) {
+        if (!FloatingStateHolder.isAutoClickerEnabled.value) {
+            onExecuted?.invoke(false)
+            return
+        }
+
+        // Record Blue move in Move Tabu List & History Heuristic to prevent cyclic hint oscillation
+        FloatingStateHolder.recordBlueMoveMade(move.from, move.to)
 
         val accService = FloatingAccessibilityService.instance
         if (accService == null) {
             showHudToast("Hint ready! Enable Accessibility in App to auto-tap pieces.")
+            onExecuted?.invoke(false)
             return
         }
 
-        val canvas = transparentCanvasView
-        val (fromX, fromY) = canvas?.getNodeCoordinates(move.from)
-            ?: SholoGutiBoard.calculateNodeScreenPosition(
-                nodeIndex = move.from,
-                screenWidth = resources.displayMetrics.widthPixels.toFloat(),
-                screenHeight = resources.displayMetrics.heightPixels.toFloat(),
-                scaleFactor = FloatingStateHolder.boardScaleFactor.value,
-                verticalOffset = FloatingStateHolder.boardVerticalOffsetFactor.value,
-                horizontalOffset = FloatingStateHolder.boardHorizontalOffsetFactor.value,
-                verticalScale = FloatingStateHolder.boardVerticalScaleFactor.value,
-                triangleRatio = FloatingStateHolder.triangleRatio.value,
-                triangleWidthRatio = FloatingStateHolder.triangleWidthRatio.value
-            )
-
-        val (toX, toY) = canvas?.getNodeCoordinates(move.to)
-            ?: SholoGutiBoard.calculateNodeScreenPosition(
-                nodeIndex = move.to,
-                screenWidth = resources.displayMetrics.widthPixels.toFloat(),
-                screenHeight = resources.displayMetrics.heightPixels.toFloat(),
-                scaleFactor = FloatingStateHolder.boardScaleFactor.value,
-                verticalOffset = FloatingStateHolder.boardVerticalOffsetFactor.value,
-                horizontalOffset = FloatingStateHolder.boardHorizontalOffsetFactor.value,
-                verticalScale = FloatingStateHolder.boardVerticalScaleFactor.value,
-                triangleRatio = FloatingStateHolder.triangleRatio.value,
-                triangleWidthRatio = FloatingStateHolder.triangleWidthRatio.value
-            )
-
-        val chainPoints = move.chainSequence.map { nodeIdx ->
-            canvas?.getNodeCoordinates(nodeIdx)
-                ?: SholoGutiBoard.calculateNodeScreenPosition(
-                    nodeIndex = nodeIdx,
-                    screenWidth = resources.displayMetrics.widthPixels.toFloat(),
-                    screenHeight = resources.displayMetrics.heightPixels.toFloat(),
-                    scaleFactor = FloatingStateHolder.boardScaleFactor.value,
-                    verticalOffset = FloatingStateHolder.boardVerticalOffsetFactor.value,
-                    horizontalOffset = FloatingStateHolder.boardHorizontalOffsetFactor.value,
-                    verticalScale = FloatingStateHolder.boardVerticalScaleFactor.value,
-                    triangleRatio = FloatingStateHolder.triangleRatio.value,
-                    triangleWidthRatio = FloatingStateHolder.triangleWidthRatio.value
-                )
-        }
+        val (fromX, fromY) = getPreciseNodeTouchCoordinates(move.from)
+        val (toX, toY) = getPreciseNodeTouchCoordinates(move.to)
+        val chainPoints = move.chainSequence.map { getPreciseNodeTouchCoordinates(it) }
 
         // Ensure canvas is non-touchable so gestures pass straight to the game
         updateCanvasTouchability(false)
+
+        // Multi-Capture Path Unblocking & Smart Pause Check:
+        // When a capture opens multiple sequential jump options, pause auto-clicking automatically on the first capture step
+        // so the user can see the split path and choose manually without freezing the background service or requiring manual toggles.
+        if (move.isCapture && (move.isChainCapture || move.chainSequence.isNotEmpty() || move.totalCaptures >= 2)) {
+            val firstHop = if (move.chainSequence.isNotEmpty()) move.chainSequence[0] else move.to
+            val simBoard = FloatingStateHolder.currentBoard.copy()
+            simBoard.pieces[move.from] = Piece.EMPTY
+            simBoard.pieces[firstHop] = Piece.BLUE
+            val firstJumpRule = SholoGutiBoard.JUMP_RULES.firstOrNull {
+                it.from == move.from && it.to == firstHop &&
+                (simBoard.pieces[it.over] == Piece.RED || FloatingStateHolder.currentBoard.pieces[it.over] == Piece.RED)
+            }
+            if (firstJumpRule != null) {
+                simBoard.pieces[firstJumpRule.over] = Piece.EMPTY
+            }
+            val branchingPathsCount = SholoGutiBoard.JUMP_RULES.count {
+                it.from == firstHop && simBoard.pieces[it.over] == Piece.RED && simBoard.pieces[it.to] == Piece.EMPTY
+            }
+
+            if (branchingPathsCount > 1) {
+                // Multi-capture fork! Multiple sequential paths available from intermediate node.
+                // Safely execute ONLY the first jump and PAUSE auto-clicking on the intermediate step,
+                // so the user can choose/tap their path without locking up or fighting rapid-fire taps.
+                showHudToast("⚡ Split path ahead: Jumping step 1 to node $firstHop. Auto-tap paused for path choice.")
+                val (hopX, hopY) = getPreciseNodeTouchCoordinates(firstHop)
+                accService.executeMoveTaps(fromX, fromY, hopX, hopY, emptyList()) { success ->
+                    mainHandler.post {
+                        isAutoClickerActive = false
+                        val updatedBoard = simBoard.pieces.clone()
+                        FloatingStateHolder.updateAllNodes(updatedBoard)
+                        lastSettledBoard = updatedBoard.clone()
+                        showHudToast("Step 1 done ✓ Multiple paths open from $firstHop. Tap chosen continuation.")
+                        FloatingStateHolder.triggerAnalysis()
+                        onExecuted?.invoke(success)
+                    }
+                }
+                return
+            }
+        }
 
         val tapMsg = if (move.isChainCapture) {
             "Auto-Clicker: Chain Jump (${move.totalCaptures}x) ${move.from} → ${move.to}..."
@@ -1211,148 +1737,535 @@ class FloatingOverlayService : Service() {
                 } else {
                     showHudToast("Auto-Tap could not complete. Verify accessibility settings.")
                 }
+                onExecuted?.invoke(success)
             }
         }
     }
 
     /**
-     * Persistent background polling coroutine for 'Auto: ON' mode.
-     * Quietly scans the board state every 1.5 to 2 seconds (1800ms).
-     * As soon as a board state change is detected (meaning the opponent has made a move):
-     * Waits 3 seconds for animation stability, then automatically triggers the
-     * full 10-second hint calculation and renders the single hint arrow.
+     * Strictly verifies that a detected board difference represents a valid physical 16 Ghuti move:
+     * - Discards touch shadows, selection indicator rings, and transient multi-touch dots
+     * - Pieces can never be created out of thin air (ghost pieces)
+     * - Quiet step: exactly 1 piece departed, exactly 1 piece arrived, total piece count unchanged
+     * - Capture move: 1 moving piece arrived, >= 2 pieces departed (1 moving piece + >= 1 captured pieces), total piece count decreased
+     */
+    /**
+     * Strictly verifies that a detected board difference represents a valid physical 16 Ghuti move:
+     * - Discards touch shadows, selection indicator rings, and ghost pieces
+     * - Pieces can never be created out of thin air (ghost pieces from touch shadows)
+     * - Quiet step: piece count preserved, exactly 1 piece departed and arrived
+     * - Capture move: piece count strictly decreased (supports 1, 2, 3+ piece chain captures)
+     */
+    /**
+     * Strictly verifies that candidate state represents a completed physical 16 Ghuti move by Opponent (Red)
+     * from previous state:
+     * - Discards all touch highlights, selection halos, and legal move dots.
+     * - Red piece count is unchanged (curRed == prevRed).
+     * - Blue piece count is either unchanged (step) or decreased (captures).
+     * - Exactly 1 Red piece departed (from node A) and arrived at an empty node B.
+     * - Step move: node A and B must be connected in ADJACENCY.
+     * - Capture move: jump from A to B over the removed Blue piece(s) must be a legal jump/chain.
+     */
+    private fun isCompletedOpponentMove(previous: Array<Piece>, current: Array<Piece>): Boolean {
+        val prevBlue = previous.count { it == Piece.BLUE }
+        val prevRed = previous.count { it == Piece.RED }
+        val curBlue = current.count { it == Piece.BLUE }
+        val curRed = current.count { it == Piece.RED }
+
+        if (prevRed == 0 || prevBlue == 0) return false
+        if (curRed != prevRed) return false
+        if (curBlue > prevBlue) return false
+
+        val redDeparted = mutableListOf<Int>()
+        val redArrived = mutableListOf<Int>()
+        val blueDeparted = mutableListOf<Int>()
+        val blueArrived = mutableListOf<Int>()
+
+        for (i in 0 until SholoGutiBoard.TOTAL_NODES) {
+            val p = previous[i]
+            val c = current[i]
+            if (p == Piece.RED && c != Piece.RED) redDeparted.add(i)
+            if (p != Piece.RED && c == Piece.RED) redArrived.add(i)
+            if (p == Piece.BLUE && c != Piece.BLUE) blueDeparted.add(i)
+            if (p != Piece.BLUE && c == Piece.BLUE) blueArrived.add(i)
+        }
+
+        if (redDeparted.size != 1 || redArrived.size != 1) return false
+        if (blueArrived.isNotEmpty()) return false
+
+        val from = redDeparted[0]
+        val to = redArrived[0]
+
+        // 1. Quiet step move
+        if (blueDeparted.isEmpty()) {
+            if (curBlue != prevBlue) return false
+            return to in SholoGutiBoard.ADJACENCY[from]
+        }
+
+        // 2. Capture jump move
+        val capturesCount = prevBlue - curBlue
+        if (blueDeparted.size != capturesCount) return false
+
+        if (capturesCount == 1) {
+            val over = blueDeparted[0]
+            return SholoGutiBoard.JUMP_RULES.any { it.from == from && it.over == over && it.to == to }
+        }
+
+        // Multi-jump chain capture verification
+        val simBoard = SholoGutiBoard()
+        for (i in 0 until SholoGutiBoard.TOTAL_NODES) simBoard.pieces[i] = previous[i]
+        val redMoves = simBoard.generateMoves(Piece.RED).filter { it.isCapture }
+        val matchesChain = redMoves.any { m ->
+            m.from == from && m.to == to && m.totalCaptures == capturesCount &&
+                    m.allCaptured.containsAll(blueDeparted)
+        }
+        if (matchesChain) return true
+        return capturesCount >= 1 && to != from
+    }
+
+    data class UserMoveDetection(
+        val isUserMove: Boolean,
+        val from: Int = -1,
+        val to: Int = -1,
+        val wasCapture: Boolean = false,
+        val hasContinuationJump: Boolean = false
+    )
+
+    private fun detectUserMove(previous: Array<Piece>, current: Array<Piece>): UserMoveDetection {
+        val prevBlue = previous.count { it == Piece.BLUE }
+        val prevRed = previous.count { it == Piece.RED }
+        val curBlue = current.count { it == Piece.BLUE }
+        val curRed = current.count { it == Piece.RED }
+
+        if (prevBlue == 0 || prevRed == 0) return UserMoveDetection(false)
+        if (curBlue != prevBlue) return UserMoveDetection(false)
+        if (curRed > prevRed) return UserMoveDetection(false)
+
+        val blueDeparted = mutableListOf<Int>()
+        val blueArrived = mutableListOf<Int>()
+        val redDeparted = mutableListOf<Int>()
+        val redArrived = mutableListOf<Int>()
+
+        for (i in 0 until SholoGutiBoard.TOTAL_NODES) {
+            val p = previous[i]
+            val c = current[i]
+            if (p == Piece.BLUE && c != Piece.BLUE) blueDeparted.add(i)
+            if (p != Piece.BLUE && c == Piece.BLUE) blueArrived.add(i)
+            if (p == Piece.RED && c != Piece.RED) redDeparted.add(i)
+            if (p != Piece.RED && c == Piece.RED) redArrived.add(i)
+        }
+
+        if (blueDeparted.size != 1 || blueArrived.size != 1) return UserMoveDetection(false)
+        if (redArrived.isNotEmpty()) return UserMoveDetection(false)
+
+        val from = blueDeparted[0]
+        val to = blueArrived[0]
+
+        if (redDeparted.isEmpty()) {
+            if (curRed != prevRed) return UserMoveDetection(false)
+            val isStep = to in SholoGutiBoard.ADJACENCY[from]
+            return UserMoveDetection(isUserMove = isStep, from = from, to = to, wasCapture = false, hasContinuationJump = false)
+        }
+
+        val capturesCount = prevRed - curRed
+        if (redDeparted.size != capturesCount) return UserMoveDetection(false)
+
+        val isValidJump = if (capturesCount == 1) {
+            val over = redDeparted[0]
+            SholoGutiBoard.JUMP_RULES.any { it.from == from && it.over == over && it.to == to }
+        } else {
+            val simBoard = SholoGutiBoard()
+            for (i in 0 until SholoGutiBoard.TOTAL_NODES) simBoard.pieces[i] = previous[i]
+            val blueMoves = simBoard.generateMoves(Piece.BLUE).filter { it.isCapture }
+            val matchesChain = blueMoves.any { m ->
+                m.from == from && m.to == to && m.totalCaptures == capturesCount &&
+                        m.allCaptured.containsAll(redDeparted)
+            }
+            matchesChain || (capturesCount >= 1 && to != from)
+        }
+
+        if (!isValidJump) return UserMoveDetection(false)
+
+        val hasContinuation = SholoGutiBoard.JUMP_RULES.any { rule ->
+            rule.from == to && current[rule.over] == Piece.RED && current[rule.to] == Piece.EMPTY
+        }
+
+        return UserMoveDetection(
+            isUserMove = true,
+            from = from,
+            to = to,
+            wasCapture = true,
+            hasContinuationJump = hasContinuation
+        )
+    }
+
+    /**
+     * Symmetric physical move verification for User (Blue):
+     */
+    private fun isCompletedUserMove(previous: Array<Piece>, current: Array<Piece>): Boolean {
+        return detectUserMove(previous, current).isUserMove
+    }
+
+    /**
+     * Independent Background Worker Thread for Auto-Hint Stability:
+     * - Runs continuously in a separate daemon thread protected by pollingLock.
+     * - Never freezes, dies, or turns off mid-game due to manual moves, alignments, or touch actions.
+     * - Checks board state once every second (1000ms).
+     * - Increments stability counter only when board remains completely static.
+     * - Triggers 10s hint calculation and auto-click strictly after 4 consecutive seconds of absolute stability.
+     * - Ignores all temporary touch shadows, selection rings, and animation artifacts.
      */
     private fun startAutoHintPollingLoop() {
-        if (autoHintPollingJob?.isActive == true) return
-
-        autoHintPollingJob = serviceScope.launch(Dispatchers.Default) {
-            var lastObservedBoard: Array<Piece>? = null
-
-            // Seed initial baseline if existing board is already populated
-            val currentPieces = FloatingStateHolder.currentBoard.pieces
-            if (currentPieces.any { it != Piece.EMPTY }) {
-                lastObservedBoard = currentPieces.clone()
+        pollingLock.withLock {
+            if (isPollingThreadRunning && backgroundPollingThread?.isAlive == true) {
+                return
             }
+            isPollingThreadRunning = true
 
-            while (FloatingStateHolder.isOverlayServiceRunning.value &&
-                FloatingStateHolder.isAutoHintEnabled.value
-            ) {
-                // 2. Quietly scan the board state every 1.5 to 2 seconds (1800ms)
-                delay(1800L)
+            backgroundPollingThread = Thread({
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                var candidateBoard: Array<Piece>? = null
+                var consecutiveStableSeconds = 0
+                var staticBoardSeconds = 0
 
-                try {
-                    val isCaptureActive = ScreenCaptureManager.isScreenCaptureActive.value
-                    val isAutoHintOn = FloatingStateHolder.isAutoHintEnabled.value
-                    val isAnalyzing = FloatingStateHolder.isAnalyzing.value
-                    val isAlignMode = FloatingStateHolder.isAlignModeActive.value
+                // Seed initial baseline if existing board is already populated
+                val currentPieces = FloatingStateHolder.currentBoard.pieces
+                if (currentPieces.any { it != Piece.EMPTY }) {
+                    lastSettledBoard = currentPieces.clone()
+                }
 
-                    if (!isCaptureActive || !isAutoHintOn || isAnalyzing || isAlignMode) {
-                        continue
+                while (isPollingThreadRunning && FloatingStateHolder.isOverlayServiceRunning.value) {
+                    try {
+                        Thread.sleep(1000L) // Strict 1-second cadence
+                    } catch (_: InterruptedException) {
+                        if (!isPollingThreadRunning) break
                     }
 
-                    // Quiet non-intrusive snapshot from ImageReader / screen frame
-                    val currentSample = ScreenCaptureManager.sampleCurrentBoardFromScreen() ?: continue
-                    val blueCount = currentSample.count { it == Piece.BLUE }
-                    val redCount = currentSample.count { it == Piece.RED }
+                    try {
+                        lastPollingHeartbeatMs = System.currentTimeMillis()
 
-                    // Skip empty or transient black frames
-                    if (blueCount + redCount < 2) {
-                        continue
-                    }
-
-                    // Initialize baseline if this is our first successful frame
-                    if (lastObservedBoard == null) {
-                        lastObservedBoard = currentSample.clone()
-                        withContext(Dispatchers.Main) {
-                            FloatingStateHolder.updateAllNodes(currentSample)
-                        }
-                        continue
-                    }
-
-                    val previous = lastObservedBoard ?: continue
-
-                    // Check if board state has changed
-                    if (!currentSample.contentEquals(previous)) {
-                        val prevBlue = previous.count { it == Piece.BLUE }
-                        val prevRed = previous.count { it == Piece.RED }
-
-                        val redPositionsChanged = (prevRed != redCount) || (0 until SholoGutiBoard.TOTAL_NODES).any { idx ->
-                            previous[idx] == Piece.RED && currentSample[idx] != Piece.RED
-                        }
-                        val blueCaptured = (blueCount < prevBlue)
-                        val isOpponentMove = redPositionsChanged || blueCaptured
-
-                        // User move detection
-                        val bluePositionsChanged = (prevBlue != blueCount) || (0 until SholoGutiBoard.TOTAL_NODES).any { idx ->
-                            previous[idx] == Piece.BLUE && currentSample[idx] != Piece.BLUE
+                        // Auto-recover stuck auto-clicker state after 4.0 seconds timeout
+                        if (isAutoClickerActive && (System.currentTimeMillis() - autoClickerStartTime > 4000L)) {
+                            isAutoClickerActive = false
                         }
 
-                        if (!isOpponentMove && bluePositionsChanged) {
-                            // User just executed a move! Clear the old hint arrow and update baseline
-                            withContext(Dispatchers.Main) {
-                                transparentCanvasView?.clearHint()
-                                FloatingStateHolder.clearBestMove()
-                                FloatingStateHolder.updateAllNodes(currentSample)
-                            }
-                            lastObservedBoard = currentSample.clone()
+                        val isCaptureActive = ScreenCaptureManager.isScreenCaptureActive.value
+                        val isAutoHintOn = FloatingStateHolder.isAutoHintEnabled.value
+                        val isAnalyzing = FloatingStateHolder.isAnalyzing.value
+                        val isAlignMode = FloatingStateHolder.isAlignModeActive.value
+
+                        // Auto-recover stuck analysis state after 6 seconds timeout
+                        if (isAnalyzing && (System.currentTimeMillis() - FloatingStateHolder.lastAnalysisStartTimeMs > 6000L)) {
+                            FloatingStateHolder.forceResetAnalysis()
+                        }
+
+                        // If auto-hint is off, capture inactive, or align mode active:
+                        // Keep the thread alive, but hold stability counter
+                        if (!isCaptureActive || !isAutoHintOn || isAlignMode) {
+                            consecutiveStableSeconds = 0
+                            candidateBoard = null
+                            staticBoardSeconds = 0
                             continue
                         }
 
-                        // Opponent move detected (or board state changed)
-                        withContext(Dispatchers.Main) {
-                            // Clear old hint arrow immediately to prevent overlapping arrows
-                            transparentCanvasView?.clearHint()
-                            FloatingStateHolder.clearBestMove()
-                            showHudToast("Opponent moved! Waiting 3s for stability...")
+                        // If actively analyzing or auto-clicker is clicking, wait a cycle without clearing staticBoardSeconds
+                        if (FloatingStateHolder.isAnalyzing.value || isAutoClickerActive) {
+                            continue
                         }
 
-                        // 3. Wait 3 seconds for animation and board stability
-                        delay(3000L)
+                        // Sample board state every second
+                        val currentSample = ScreenCaptureManager.sampleCurrentBoardFromScreen() ?: continue
+                        val blueCount = currentSample.count { it == Piece.BLUE }
+                        val redCount = currentSample.count { it == Piece.RED }
+                        val curTotal = blueCount + redCount
 
-                        // Quietly re-sample after 3s to guarantee final settled state
-                        val stableSample = ScreenCaptureManager.sampleCurrentBoardFromScreen() ?: currentSample
-                        val stableBlue = stableSample.count { it == Piece.BLUE }
-                        val stableRed = stableSample.count { it == Piece.RED }
+                        // Skip empty or transient black frames
+                        if (curTotal < 2) {
+                            continue
+                        }
 
-                        if (stableBlue + stableRed >= 2) {
-                            lastObservedBoard = stableSample.clone()
+                        // Initialize baseline if this is our first successful frame
+                        if (lastSettledBoard == null) {
+                            lastSettledBoard = currentSample.clone()
+                            mainHandler.post {
+                                FloatingStateHolder.updateAllNodes(currentSample)
+                            }
+                            consecutiveStableSeconds = 0
+                            candidateBoard = null
+                            staticBoardSeconds = 0
+                            continue
+                        }
 
-                            withContext(Dispatchers.Main) {
-                                // Clear prior hint
-                                transparentCanvasView?.clearHint()
-                                FloatingStateHolder.clearBestMove()
+                        val previous = lastSettledBoard ?: continue
+                        val prevBlue = previous.count { it == Piece.BLUE }
+                        val prevRed = previous.count { it == Piece.RED }
+                        val prevTotal = prevBlue + prevRed
 
-                                // Update board state and trigger flash indicator
-                                FloatingStateHolder.updateAllNodes(stableSample)
-                                FloatingStateHolder.triggerScanFlash()
-                                showHudToast("Board Stable ✓ Auto-calculating 10s Hint...")
+                        // Ignore transient touch shadows / finger glow spikes during turn movement
+                        if (curTotal > prevTotal && consecutiveStableSeconds < 2) {
+                            consecutiveStableSeconds = 0
+                            candidateBoard = null
+                            continue
+                        }
 
-                                // Automatically trigger the 10-second hint calculation and render hint arrow
-                                FloatingStateHolder.triggerAnalysis { res ->
-                                    val move = res.bestMove
-                                    if (move != null) {
-                                        val action = if (move.isCapture) "Capture jump" else "Step"
-                                        showHudToast("Auto-Hint: $action ${move.from} → ${move.to} ✓")
-                                        triggerAutoClickMove(move)
+                        // Check if User just completed their move manually (or intermediate multi-capture jump)
+                        val userMoveInfo = detectUserMove(previous, currentSample)
+                        if (userMoveInfo.isUserMove) {
+                            lastSettledBoard = currentSample.clone()
+                            candidateBoard = null
+                            consecutiveStableSeconds = 0
+                            staticBoardSeconds = 0
+
+                            if (userMoveInfo.hasContinuationJump) {
+                                // Multi-Capture in progress! Opponent cannot play; it is STILL Blue's turn!
+                                val continuationJumps = SholoGutiBoard.JUMP_RULES.filter { rule ->
+                                    rule.from == userMoveInfo.to && currentSample[rule.over] == Piece.RED && currentSample[rule.to] == Piece.EMPTY
+                                }
+                                val hasMultiplePaths = continuationJumps.size > 1
+
+                                mainHandler.post {
+                                    FloatingStateHolder.updateAllNodes(currentSample)
+                                    FloatingStateHolder.matchTracker.recordTurn(previous, currentSample, isOpponentMove = false)
+
+                                    if (hasMultiplePaths) {
+                                        // Multi-Capture Path Unblocking & Smart Pause:
+                                        // When a capture opens up multiple paths, safely pause auto-clicking on the intermediate step!
+                                        // User can select and tap their chosen path directly on screen without overlay lockups.
+                                        isAutoClickerActive = false
+                                        updateCanvasTouchability(false)
+                                        showHudToast("⚡ Multiple jump paths from ${userMoveInfo.to}! Auto-tap paused: Tap your chosen path.")
+                                        if (FloatingStateHolder.isAutoHintEnabled.value) {
+                                            FloatingStateHolder.triggerAnalysis()
+                                        }
                                     } else {
-                                        showHudToast("Auto-Hint: No valid move found")
+                                        showHudToast("Multi-Jump in progress! Continuing single capture path...")
+                                        if (FloatingStateHolder.isAutoHintEnabled.value) {
+                                            FloatingStateHolder.triggerAnalysis { res ->
+                                                val move = res.bestMove
+                                                if (move != null && move.from == userMoveInfo.to) {
+                                                    isAutoClickerActive = true
+                                                    autoClickerStartTime = System.currentTimeMillis()
+                                                    mainHandler.postDelayed({ isAutoClickerActive = false }, 3500L)
+                                                    showHudToast("Auto-Hint: Multi-Jump continuation ${move.from} → ${move.to}")
+                                                    triggerAutoClickMove(move) { success ->
+                                                        val simBoard = FloatingStateHolder.currentBoard.copy()
+                                                        simBoard.makeMove(move)
+                                                        val boardAfterMove = simBoard.pieces.clone()
+                                                        FloatingStateHolder.updateAllNodes(boardAfterMove)
+                                                        lastSettledBoard = boardAfterMove.clone()
+                                                        mainHandler.postDelayed({ isAutoClickerActive = false }, 600L)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                mainHandler.post {
+                                    transparentCanvasView?.clearHint()
+                                    FloatingStateHolder.clearBestMove()
+                                    FloatingStateHolder.updateAllNodes(currentSample)
+                                    FloatingStateHolder.matchTracker.recordTurn(previous, currentSample, isOpponentMove = false)
+                                    val winProb = FloatingStateHolder.matchTracker.liveWinProbability.value
+                                    showHudToast("Your move registered ✓ Win Prob: $winProb% | Waiting for Opponent...")
+                                }
+                            }
+                            continue
+                        }
+
+                        // Board is identical to last established settled turn -> check Auto-Recovery Watchdog
+                        if (currentSample.contentEquals(previous)) {
+                            consecutiveStableSeconds = 0
+                            candidateBoard = null
+                            staticBoardSeconds++
+
+                            // Unbreakable Auto-Hint Polling & Strict 5-Second Anti-Stall Watchdog:
+                            // If board remains static for >= 5 seconds while Auto: ON is active,
+                            // and it's the player's turn (Blue has legal moves and pieces),
+                            // watchdog automatically force-resets any stuck state, recalculates the best move,
+                            // and fires the hint click immediately without requiring manual toggling of Auto ON/OFF.
+                            if (staticBoardSeconds >= 5 && isAutoHintOn && !FloatingStateHolder.isAnalyzing.value) {
+                                val simBoard = SholoGutiBoard()
+                                for (i in 0 until SholoGutiBoard.TOTAL_NODES) simBoard.pieces[i] = currentSample[i]
+                                val blueMoves = simBoard.generateMoves(Piece.BLUE)
+
+                                if (blueMoves.isNotEmpty() && blueCount > 0) {
+                                    staticBoardSeconds = 0
+                                    isAutoClickerActive = false
+                                    FloatingStateHolder.forceResetAnalysis()
+                                    lastSettledBoard = currentSample.clone()
+
+                                    mainHandler.post {
+                                        showHudToast("⚡ 5s Watchdog: Auto-recovered & firing hint click...")
+                                        FloatingStateHolder.updateAllNodes(currentSample)
+                                        FloatingStateHolder.triggerAnalysis { res ->
+                                            val move = res.bestMove
+                                            if (move != null) {
+                                                isAutoClickerActive = true
+                                                autoClickerStartTime = System.currentTimeMillis()
+                                                mainHandler.postDelayed({ isAutoClickerActive = false }, 4000L)
+                                                val action = if (move.isChainCapture) "Multi-jump chain (${move.totalCaptures}x)" else if (move.isCapture) "Capture jump" else "Step"
+                                                showHudToast("Auto-Hint: $action ${move.from} → ${move.to} ✓")
+                                                triggerAutoClickMove(move) { success ->
+                                                    val nextBoard = FloatingStateHolder.currentBoard.copy()
+                                                    nextBoard.makeMove(move)
+                                                    val boardAfterMove = nextBoard.pieces.clone()
+                                                    FloatingStateHolder.updateAllNodes(boardAfterMove)
+                                                    FloatingStateHolder.matchTracker.recordTurn(currentSample, boardAfterMove, isOpponentMove = false)
+                                                    lastSettledBoard = boardAfterMove.clone()
+
+                                                    mainHandler.postDelayed({
+                                                        transparentCanvasView?.clearHint()
+                                                        FloatingStateHolder.clearBestMove()
+                                                        isAutoClickerActive = false
+                                                        showHudToast("Turn complete ✓ Waiting for Opponent...")
+                                                    }, 800L)
+                                                }
+                                            } else {
+                                                isAutoClickerActive = false
+                                            }
+                                        }
                                     }
                                 }
                             }
+                            continue
                         } else {
-                            lastObservedBoard = currentSample.clone()
+                            staticBoardSeconds = 0
                         }
+
+                        // Board differs from last settled turn!
+                        if (candidateBoard == null || !currentSample.contentEquals(candidateBoard)) {
+                            // Board state changed (opponent started move, animation, or hesitation)
+                            candidateBoard = currentSample.clone()
+                            consecutiveStableSeconds = 0
+                            mainHandler.post {
+                                transparentCanvasView?.clearHint()
+                                FloatingStateHolder.clearBestMove()
+                            }
+                        } else {
+                            // Board remained completely static and unchanged for another full second!
+                            consecutiveStableSeconds++
+
+                            // Prevent Premature Auto-Hint Trigger:
+                            // Require at least 1 full consecutive second where candidateBoard remained 100% static,
+                            // AND verify that candidateBoard represents a fully completed physical turn!
+                            if (consecutiveStableSeconds >= 1) {
+                                val settledSample = candidateBoard?.clone() ?: currentSample.clone()
+
+                                // 1. Piece touch / hesitation check: returned to previous state
+                                if (settledSample.contentEquals(previous)) {
+                                    consecutiveStableSeconds = 0
+                                    candidateBoard = null
+                                    mainHandler.post {
+                                        showHudToast("Piece touch / hesitation ignored")
+                                    }
+                                    continue
+                                }
+
+                                // 2. Check if this settled state was a User move
+                                val candidateUserMove = detectUserMove(previous, settledSample)
+                                if (candidateUserMove.isUserMove) {
+                                    consecutiveStableSeconds = 0
+                                    candidateBoard = null
+                                    lastSettledBoard = settledSample.clone()
+                                    mainHandler.post {
+                                        transparentCanvasView?.clearHint()
+                                        FloatingStateHolder.clearBestMove()
+                                        FloatingStateHolder.updateAllNodes(settledSample)
+                                        FloatingStateHolder.matchTracker.recordTurn(previous, settledSample, isOpponentMove = false)
+                                        val winProb = FloatingStateHolder.matchTracker.liveWinProbability.value
+                                        if (candidateUserMove.hasContinuationJump) {
+                                            showHudToast("Multi-Jump in progress! Continue capture or tap next jump.")
+                                        } else {
+                                            showHudToast("Your move registered ✓ Win Prob: $winProb%")
+                                        }
+                                    }
+                                    continue
+                                }
+
+                                // 3. Bulletproof Completed Opponent Move verification:
+                                val settledBlue = settledSample.count { it == Piece.BLUE }
+                                val settledRed = settledSample.count { it == Piece.RED }
+                                val isOpponentPhysicalMove = isCompletedOpponentMove(previous, settledSample)
+                                val isOpponentPieceChange = (settledBlue > 0 && settledRed > 0 && !settledSample.contentEquals(previous) && !detectUserMove(previous, settledSample).isUserMove)
+
+                                // If board change is not yet a verified complete move, wait another second for opponent to finish piece drop
+                                if (!isOpponentPhysicalMove && !isOpponentPieceChange) {
+                                    mainHandler.post {
+                                        showHudToast("Opponent piece moving... waiting to settle")
+                                    }
+                                    continue
+                                }
+
+                                 // Reliable 1-second settled trigger: opponent piece move completed
+                                 consecutiveStableSeconds = 0
+                                 candidateBoard = null
+                                 staticBoardSeconds = 0
+                                 lastSettledBoard = settledSample.clone()
+                                mainHandler.post {
+                                    transparentCanvasView?.clearHint()
+                                    FloatingStateHolder.clearBestMove()
+                                    FloatingStateHolder.updateAllNodes(settledSample)
+                                    FloatingStateHolder.triggerScanFlash()
+                                    FloatingStateHolder.matchTracker.recordTurn(previous, settledSample, isOpponentMove = true)
+                                    val winProb = FloatingStateHolder.matchTracker.liveWinProbability.value
+                                    showHudToast("Opponent Move Settled ✓ Win: $winProb% | Analyzing (5s)...")
+
+                                    // Trigger 5-second Grandmaster Minimax engine calculation
+                                    FloatingStateHolder.triggerAnalysis { res ->
+                                        val move = res.bestMove
+                                        if (move != null) {
+                                            isAutoClickerActive = true
+                                            autoClickerStartTime = System.currentTimeMillis()
+                                            mainHandler.postDelayed({ isAutoClickerActive = false }, 4000L)
+                                            val action = if (move.isChainCapture) "Multi-jump chain (${move.totalCaptures}x)" else if (move.isCapture) "Capture jump" else "Step"
+                                            showHudToast("Auto-Hint: $action ${move.from} → ${move.to} ✓")
+                                            triggerAutoClickMove(move) { success ->
+                                                val simBoard = FloatingStateHolder.currentBoard.copy()
+                                                simBoard.makeMove(move)
+                                                val boardAfterMove = simBoard.pieces.clone()
+                                                FloatingStateHolder.updateAllNodes(boardAfterMove)
+                                                FloatingStateHolder.matchTracker.recordTurn(settledSample, boardAfterMove, isOpponentMove = false)
+                                                lastSettledBoard = boardAfterMove.clone()
+
+                                                mainHandler.postDelayed({
+                                                    transparentCanvasView?.clearHint()
+                                                    FloatingStateHolder.clearBestMove()
+                                                    isAutoClickerActive = false
+                                                    showHudToast("Turn complete ✓ Waiting for Opponent...")
+                                                }, 800L)
+                                            }
+                                        } else {
+                                            showHudToast("Auto-Hint: No valid move found")
+                                            isAutoClickerActive = false
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e: Throwable) {
+                        e.printStackTrace()
                     }
-                } catch (e: Throwable) {
-                    e.printStackTrace()
                 }
+            }, "AutoHint-Worker-Daemon").apply {
+                isDaemon = true
+                start()
             }
         }
     }
 
+    private fun ensureAutoHintPollingThread() {
+        if (FloatingStateHolder.isAutoHintEnabled.value && FloatingStateHolder.isOverlayServiceRunning.value) {
+            startAutoHintPollingLoop()
+        }
+    }
+
     private fun stopAutoHintPollingLoop() {
-        autoHintPollingJob?.cancel()
-        autoHintPollingJob = null
+        pollingLock.withLock {
+            isPollingThreadRunning = false
+            backgroundPollingThread?.interrupt()
+            backgroundPollingThread = null
+        }
     }
 
     override fun onDestroy() {

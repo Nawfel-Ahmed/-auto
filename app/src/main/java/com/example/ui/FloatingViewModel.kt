@@ -31,6 +31,13 @@ class FloatingViewModel : ViewModel() {
     val analysisResult: StateFlow<EngineResult?> = FloatingStateHolder.analysisResult
     val analysisTimeLimitSec: StateFlow<Int> = FloatingStateHolder.analysisTimeLimitSec
 
+    // Match Tracker & Advantage
+    val liveWinProbability: StateFlow<Int> = FloatingStateHolder.matchTracker.liveWinProbability
+    val advantageText: StateFlow<String> = FloatingStateHolder.matchTracker.advantageText
+    val moveHistory: StateFlow<List<com.example.engine.MatchMoveRecord>> = FloatingStateHolder.matchTracker.moveHistory
+    val blueCapturedCount: StateFlow<Int> = FloatingStateHolder.matchTracker.blueCapturedCount
+    val redCapturedCount: StateFlow<Int> = FloatingStateHolder.matchTracker.redCapturedCount
+
     // Calibration & interactive alignment parameters
     val boardVerticalOffsetFactor: StateFlow<Float> = FloatingStateHolder.boardVerticalOffsetFactor
     val boardHorizontalOffsetFactor: StateFlow<Float> = FloatingStateHolder.boardHorizontalOffsetFactor
@@ -42,6 +49,8 @@ class FloatingViewModel : ViewModel() {
     val isAlignModeActive: StateFlow<Boolean> = FloatingStateHolder.isAlignModeActive
     val isSyncModeActive: StateFlow<Boolean> = FloatingStateHolder.isSyncModeActive
     val showNodeIndicators: StateFlow<Boolean> = FloatingStateHolder.showNodeIndicators
+    val manualDefenseMode: StateFlow<Boolean?> = FloatingStateHolder.manualDefenseMode
+    val overlayAlpha: StateFlow<Float> = FloatingStateHolder.overlayAlpha
 
     val isScreenCaptureActive: StateFlow<Boolean> = ScreenCaptureManager.isScreenCaptureActive
     val lastScanResult: StateFlow<ScanSummary?> = ScreenCaptureManager.lastScanResult
@@ -171,5 +180,13 @@ class FloatingViewModel : ViewModel() {
 
     fun toggleHaptic(enabled: Boolean) {
         FloatingStateHolder.setHapticEnabled(enabled)
+    }
+
+    fun setManualDefenseMode(isDefense: Boolean?) {
+        FloatingStateHolder.setManualDefenseMode(isDefense)
+    }
+
+    fun setOverlayAlpha(alpha: Float) {
+        FloatingStateHolder.setOverlayAlpha(alpha)
     }
 }

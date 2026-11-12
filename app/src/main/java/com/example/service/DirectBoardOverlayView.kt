@@ -30,13 +30,13 @@ class DirectBoardOverlayView(context: Context) : View(context) {
     private var showNodeIndicators = false
     private var scanFlash = false
 
-    private var verticalOffset = 0.50f
-    private var horizontalOffset = 0.50f
-    private var scaleFactor = 0.88f
-    private var verticalScale = 1.00f
-    private var triangleRatio = 0.50f
-    private var triangleWidthRatio = 1.00f
-    private var nodeRadiusFactor = 1.00f
+    private var verticalOffset = 0.4566f
+    private var horizontalOffset = 0.5000f
+    private var scaleFactor = 0.8889f
+    private var verticalScale = 1.0000f
+    private var triangleRatio = 1.0000f
+    private var triangleWidthRatio = 1.0000f
+    private var nodeRadiusFactor = 1.0000f
 
     // Interactive Drag and Pinch Scale Tracking
     private var lastTouchX = 0f
@@ -101,6 +101,24 @@ class DirectBoardOverlayView(context: Context) : View(context) {
         strokeCap = Paint.Cap.ROUND
     }
 
+    private val stepBadgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#0F172A")
+        style = Paint.Style.FILL
+    }
+
+    private val stepBadgeRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#00E5FF")
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+    }
+
+    private val stepBadgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 22f
+        isFakeBoldText = true
+        textAlign = Paint.Align.CENTER
+    }
+
     // Alignment Mode Guide Paints
     private val alignLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#00E676")
@@ -157,15 +175,15 @@ class DirectBoardOverlayView(context: Context) : View(context) {
     }
 
     private val nodeBluePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#00E5FF") // Crisp Cyan indicator ring
+        color = Color.argb(150, 0, 229, 255) // Translucent Cyan indicator ring
         style = Paint.Style.STROKE
-        strokeWidth = 3f
+        strokeWidth = 2.5f
     }
 
     private val nodeRedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#FF1744") // Crisp Ruby Red indicator ring
+        color = Color.argb(150, 255, 23, 68) // Translucent Ruby Red indicator ring
         style = Paint.Style.STROKE
-        strokeWidth = 3f
+        strokeWidth = 2.5f
     }
 
     private val nodeBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -225,8 +243,22 @@ class DirectBoardOverlayView(context: Context) : View(context) {
     }
 
     fun getNodeCoordinates(index: Int): Pair<Float, Float> {
-        val w = width.toFloat().takeIf { it > 0 } ?: resources.displayMetrics.widthPixels.toFloat()
-        val h = height.toFloat().takeIf { it > 0 } ?: resources.displayMetrics.heightPixels.toFloat()
+        val wm = context.getSystemService(Context.WINDOW_SERVICE) as? android.view.WindowManager
+        val metrics = android.util.DisplayMetrics()
+        val w: Float
+        val h: Float
+        if (wm != null) {
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(metrics)
+            w = metrics.widthPixels.toFloat()
+            h = metrics.heightPixels.toFloat()
+        } else if (width > 0 && height > 0) {
+            w = width.toFloat()
+            h = height.toFloat()
+        } else {
+            w = resources.displayMetrics.widthPixels.toFloat()
+            h = resources.displayMetrics.heightPixels.toFloat()
+        }
         return SholoGutiBoard.calculateNodeScreenPosition(
             nodeIndex = index,
             screenWidth = w,
@@ -394,43 +426,26 @@ class DirectBoardOverlayView(context: Context) : View(context) {
         }
     }
 
-    private fun drawBestMoveHint(canvas: Canvas, move: GutiMove) {
-        val (fromX, fromY) = getNodeCoordinates(move.from)
-        val (toX, toY) = getNodeCoordinates(move.to)
-        val dx = toX - fromX
-        val dy = toY - fromY
+    private fun drawArrowSegment(canvas: Canvas, x1: Float, y1: Float, x2: Float, y2: Float, baseRadius: Float) {
+        val dx = x2 - x1
+        val dy = y2 - y1
         val dist = hypot(dx.toDouble(), dy.toDouble()).toFloat()
-        if (dist < 12f) return
+        if (dist < 10f) return
 
         val unitX = dx / dist
         val unitY = dy / dist
+        val arrowHeadLength = (baseRadius * 1.10f).coerceAtMost(dist * 0.42f)
 
-        val w = width.toFloat().takeIf { it > 0 } ?: resources.displayMetrics.widthPixels.toFloat()
-        val u = w * (scaleFactor / 4.0f)
-        val baseRadius = (u * 0.25f * nodeRadiusFactor).coerceIn(10f, 70f)
+        val startX = x1 + unitX * (baseRadius * 0.75f)
+        val startY = y1 + unitY * (baseRadius * 0.75f)
+        val tipX = x2 - unitX * (baseRadius * 0.25f)
+        val tipY = y2 - unitY * (baseRadius * 0.25f)
+        val shaftEndX = tipX - unitX * (arrowHeadLength * 0.65f)
+        val shaftEndY = tipY - unitY * (arrowHeadLength * 0.65f)
 
-        // 1. Pulsating Source Node Halo (Source marker)
-        canvas.drawCircle(fromX, fromY, baseRadius + pulseRadiusOffset, fromHaloPaint)
-        canvas.drawCircle(fromX, fromY, baseRadius * 0.85f, toHaloRingPaint)
-
-        // 2. Target Destination Node (Cyan target ring)
-        canvas.drawCircle(toX, toY, baseRadius, toHaloPaint)
-        canvas.drawCircle(toX, toY, baseRadius + 4f, toHaloRingPaint)
-
-        // 3. Arrow Geometry: Clean single shaft stopping at the arrowhead base
-        val arrowHeadLength = (baseRadius * 1.15f).coerceAtMost(dist * 0.45f)
-        val startX = fromX + unitX * (baseRadius * 0.90f)
-        val startY = fromY + unitY * (baseRadius * 0.90f)
-        val tipX = toX - unitX * (baseRadius * 0.25f)
-        val tipY = toY - unitY * (baseRadius * 0.25f)
-        val shaftEndX = tipX - unitX * (arrowHeadLength * 0.70f)
-        val shaftEndY = tipY - unitY * (arrowHeadLength * 0.70f)
-
-        // Draw SINGLE shaft (one glowing underlay, one crisp primary line)
         canvas.drawLine(startX, startY, shaftEndX, shaftEndY, arrowGlowPaint)
         canvas.drawLine(startX, startY, shaftEndX, shaftEndY, arrowPaint)
 
-        // 4. Single Arrowhead at Destination
         val angle = atan2(dy.toDouble(), dx.toDouble())
         val arrowAngle = Math.PI / 6.2 // ~29 degrees
 
@@ -451,18 +466,53 @@ class DirectBoardOverlayView(context: Context) : View(context) {
             close()
         }
         canvas.drawPath(headPath, arrowHeadPaint)
+    }
 
-        // 5. Chain Jump Waypoints
+    private fun drawBestMoveHint(canvas: Canvas, move: GutiMove) {
+        val (fromX, fromY) = getNodeCoordinates(move.from)
+        val (toX, toY) = getNodeCoordinates(move.to)
+
+        val w = width.toFloat().takeIf { it > 0 } ?: resources.displayMetrics.widthPixels.toFloat()
+        val u = w * (scaleFactor / 4.0f)
+        val baseRadius = (u * 0.25f * nodeRadiusFactor).coerceIn(10f, 70f)
+
+        // 1. Pulsating Source Node Halo (Source marker)
+        canvas.drawCircle(fromX, fromY, baseRadius + pulseRadiusOffset, fromHaloPaint)
+        canvas.drawCircle(fromX, fromY, baseRadius * 0.85f, toHaloRingPaint)
+
+        // 2. Target Destination Node (Cyan target ring)
+        canvas.drawCircle(toX, toY, baseRadius, toHaloPaint)
+        canvas.drawCircle(toX, toY, baseRadius + 4f, toHaloRingPaint)
+
+        // 3. Arrow Geometry: Clean single shaft or sequential multi-capture chain arrows
         if (move.chainSequence.isNotEmpty()) {
+            val pathNodes = listOf(move.from) + move.chainSequence + listOf(move.to)
+            for (i in 0 until pathNodes.size - 1) {
+                val (segFromX, segFromY) = getNodeCoordinates(pathNodes[i])
+                val (segToX, segToY) = getNodeCoordinates(pathNodes[i + 1])
+                drawArrowSegment(canvas, segFromX, segFromY, segToX, segToY, baseRadius)
+
+                // Numbered badge on each hop segment (①, ②, ③)
+                val badgeX = (segFromX + segToX) / 2f
+                val badgeY = (segFromY + segToY) / 2f
+                val badgeRadius = (baseRadius * 0.45f).coerceIn(12f, 24f)
+                canvas.drawCircle(badgeX, badgeY, badgeRadius, stepBadgePaint)
+                canvas.drawCircle(badgeX, badgeY, badgeRadius, stepBadgeRingPaint)
+                canvas.drawText("${i + 1}", badgeX, badgeY + badgeRadius * 0.38f, stepBadgeTextPaint)
+            }
+
+            // Intermediate Waypoint Rings
             for (stepNode in move.chainSequence) {
                 if (stepNode in 0 until SholoGutiBoard.TOTAL_NODES) {
                     val (sx, sy) = getNodeCoordinates(stepNode)
-                    canvas.drawCircle(sx, sy, baseRadius * 0.85f, toHaloRingPaint)
+                    canvas.drawCircle(sx, sy, baseRadius + pulseRadiusOffset * 0.5f, toHaloRingPaint)
                 }
             }
+        } else {
+            drawArrowSegment(canvas, fromX, fromY, toX, toY, baseRadius)
         }
 
-        // 6. If Jump Capture: Draw prominent Red 'X' on all captured pieces (including chain captures)
+        // 4. If Jump Capture: Draw prominent Red 'X' on all captured pieces (including chain captures)
         val targetsToCross = if (move.allCaptured.isNotEmpty()) move.allCaptured else if (move.isCapture) listOf(move.captured) else emptyList()
         val warningPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.parseColor("#B71C1C")

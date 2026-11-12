@@ -54,6 +54,7 @@ class FloatingAccessibilityService : AccessibilityService() {
 
         val path = Path().apply {
             moveTo(x, y)
+            lineTo(x, y)
         }
         val stroke = GestureDescription.StrokeDescription(path, 0L, 50L)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
@@ -104,9 +105,10 @@ class FloatingAccessibilityService : AccessibilityService() {
             val (px, py) = tapSequence[index]
             val dispatched = performTap(px, py) { ok ->
                 if (ok && index + 1 < tapSequence.size) {
+                    val delayMs = if (index == 0) 450L else 750L
                     mainHandler.postDelayed({
                         dispatchStep(index + 1)
-                    }, 400L)
+                    }, delayMs)
                 } else {
                     onFinished?.invoke(ok)
                 }

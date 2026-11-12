@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import com.example.engine.EngineResult
 import com.example.engine.GutiMove
+import com.example.engine.MatchTracker
 import com.example.engine.Piece
 import com.example.engine.SholoGutiBoard
 import com.example.engine.SholoGutiEngine
@@ -49,8 +50,45 @@ object FloatingStateHolder {
     private val _isHapticEnabled = MutableStateFlow(true)
     val isHapticEnabled: StateFlow<Boolean> = _isHapticEnabled.asStateFlow()
 
+    // Engine Mode: null = Auto (switches based on map pieces), true = Manual Defense, false = Manual Normal
+    private val _manualDefenseMode = MutableStateFlow<Boolean?>(null)
+    val manualDefenseMode: StateFlow<Boolean?> = _manualDefenseMode.asStateFlow()
+
+    fun setManualDefenseMode(isDefense: Boolean?) {
+        _manualDefenseMode.value = isDefense
+    }
+
+    // Panel Opacity / Background Transparency (Japsa / Clear Board Visibility)
+    private val _overlayAlpha = MutableStateFlow(0.88f)
+    val overlayAlpha: StateFlow<Float> = _overlayAlpha.asStateFlow()
+
+    fun setOverlayAlpha(alpha: Float) {
+        _overlayAlpha.value = alpha.coerceIn(0.20f, 1.0f)
+        savePrefs()
+    }
+
     // 16 Ghuti Board State
     val currentBoard = SholoGutiBoard()
+    val matchTracker = MatchTracker()
+
+    // History Heuristic / Move Tabu List & Position Hashes (Anti-Loop)
+    private val _recentBlueMoves = java.util.concurrent.CopyOnWriteArrayList<Pair<Int, Int>>()
+    val recentBlueMoves: List<Pair<Int, Int>> get() = _recentBlueMoves.toList()
+
+    private val _recentBoardHashes = java.util.concurrent.CopyOnWriteArrayList<Long>()
+    val recentBoardHashes: List<Long> get() = _recentBoardHashes.toList()
+
+    fun recordBlueMoveMade(from: Int, to: Int) {
+        _recentBlueMoves.add(Pair(from, to))
+        while (_recentBlueMoves.size > 8) {
+            _recentBlueMoves.removeAt(0)
+        }
+        val currentHash = engine.computeBoardHash(currentBoard)
+        _recentBoardHashes.add(currentHash)
+        while (_recentBoardHashes.size > 12) {
+            _recentBoardHashes.removeAt(0)
+        }
+    }
 
     private val _boardState = MutableStateFlow<Array<Piece>>(currentBoard.pieces.clone())
     val boardState: StateFlow<Array<Piece>> = _boardState.asStateFlow()
@@ -72,8 +110,8 @@ object FloatingStateHolder {
     val analysisTimeLimitSec: StateFlow<Int> = _analysisTimeLimitSec.asStateFlow()
 
     // Calibrated Alignment Parameters (Percentage-based & Persistent)
-    const val DEFAULT_SCALE = 0.886f
-    const val DEFAULT_V_OFFSET = 0.4764f
+    const val DEFAULT_SCALE = 0.8889f
+    const val DEFAULT_V_OFFSET = 0.4566f
     const val DEFAULT_H_OFFSET = 0.5000f
     const val DEFAULT_V_SCALE = 1.0000f
     const val DEFAULT_TRI_RATIO = 1.0000f
@@ -124,8 +162,15 @@ object FloatingStateHolder {
         if (prefs == null) {
             prefs = context.getSharedPreferences("sholo_guti_align_prefs", Context.MODE_PRIVATE)
             prefs?.let { p ->
-                _boardScaleFactor.value = p.getFloat("scale", DEFAULT_SCALE)
-                _boardVerticalOffsetFactor.value = p.getFloat("vOffset", DEFAULT_V_OFFSET)
+                val savedScale = p.getFloat("scale", DEFAULT_SCALE)
+                _boardScaleFactor.value = if (kotlin.math.abs(savedScale - 0.886f) < 0.005f) DEFAULT_SCALE else savedScale
+                val savedVOffset = p.getFloat("vOffset", DEFAULT_V_OFFSET)
+                // Auto-upgrade legacy offset (0.4764f / 0.4585f) to true calibrated center (0.4566f)
+                _boardVerticalOffsetFactor.value = if (kotlin.math.abs(savedVOffset - 0.4764f) < 0.005f || kotlin.math.abs(savedVOffset - 0.4585f) < 0.005f) {
+                    DEFAULT_V_OFFSET
+                } else {
+                    savedVOffset
+                }
                 _boardHorizontalOffsetFactor.value = p.getFloat("hOffset", DEFAULT_H_OFFSET)
                 _boardVerticalScaleFactor.value = p.getFloat("vScale", DEFAULT_V_SCALE)
                 _triangleRatio.value = p.getFloat("triRatio", DEFAULT_TRI_RATIO)
@@ -133,6 +178,7 @@ object FloatingStateHolder {
                 _nodeRadiusFactor.value = p.getFloat("nodeRadiusFactor", DEFAULT_NODE_RADIUS_FACTOR)
                 _isAutoHintEnabled.value = p.getBoolean("autoHintEnabled", true)
                 _isAutoClickerEnabled.value = p.getBoolean("autoClickerEnabled", true)
+                _overlayAlpha.value = p.getFloat("overlay_alpha", 0.88f)
             }
         }
     }
@@ -148,6 +194,7 @@ object FloatingStateHolder {
             putFloat("nodeRadiusFactor", _nodeRadiusFactor.value)
             putBoolean("autoHintEnabled", _isAutoHintEnabled.value)
             putBoolean("autoClickerEnabled", _isAutoClickerEnabled.value)
+            putFloat("overlay_alpha", _overlayAlpha.value)
             apply()
         }
     }
@@ -354,6 +401,9 @@ object FloatingStateHolder {
         _boardState.value = currentBoard.pieces.clone()
         _bestMove.value = null
         _analysisResult.value = null
+        _recentBlueMoves.clear()
+        _recentBoardHashes.clear()
+        matchTracker.resetMatch()
         _lastActionMessage.value = "Board reset to default"
     }
 
@@ -364,6 +414,8 @@ object FloatingStateHolder {
         _boardState.value = currentBoard.pieces.clone()
         _bestMove.value = null
         _analysisResult.value = null
+        _recentBlueMoves.clear()
+        _recentBoardHashes.clear()
         _lastActionMessage.value = "Board cleared"
     }
 
@@ -372,20 +424,39 @@ object FloatingStateHolder {
         _analysisResult.value = null
     }
 
+    var lastAnalysisStartTimeMs: Long = 0L
+
+    fun forceResetAnalysis() {
+        try {
+            analysisJob?.cancel()
+        } catch (_: Throwable) {}
+        _isAnalyzing.value = false
+        _analysisCountdownSec.value = 0
+        _lastActionMessage.value = "Ready"
+    }
+
     fun triggerAnalysis(onComplete: ((EngineResult) -> Unit)? = null) {
-        if (_isAnalyzing.value) return
+        if (_isAnalyzing.value) {
+            // Watchdog check: If analysis has been active for over 7s, force reset immediately!
+            if (System.currentTimeMillis() - lastAnalysisStartTimeMs > 7000L) {
+                forceResetAnalysis()
+            } else {
+                return
+            }
+        }
 
         try {
             analysisJob?.cancel()
             _isAnalyzing.value = true
+            lastAnalysisStartTimeMs = System.currentTimeMillis()
             // Strictly clear any prior hint arrow so it does not appear on screen during countdown
             _bestMove.value = null
             _analysisResult.value = null
 
-            val limitSec = 10
+            val limitSec = 5
             _analysisTimeLimitSec.value = limitSec
             _analysisCountdownSec.value = limitSec
-            _lastActionMessage.value = "Analyzing board deeply (10s)..."
+            _lastActionMessage.value = "Analyzing board (5s)..."
 
             analysisJob = scope.launch(Dispatchers.Default) {
                 val startMs = System.currentTimeMillis()
@@ -407,12 +478,15 @@ object FloatingStateHolder {
                         boardCopy.setupDefaultBoard()
                     }
 
-                    // Run deep Minimax engine across the 10-second window
+                    // Run full-power Grandmaster Minimax engine (4 to 5+ plies) fully utilizing the 5-second window
                     var latestFoundMove: GutiMove? = null
                     val engineResult = engine.findBestMove(
                         board = boardCopy,
-                        timeLimitMs = limitSec * 1000L,
-                        maxDepth = 64,
+                        timeLimitMs = 4800L, // Deep 4.8s search window
+                        maxDepth = 8, // Full 4 to 5+ plies iterative deepening with alpha-beta pruning
+                        tabuMoves = recentBlueMoves,
+                        recentPositions = recentBoardHashes,
+                        isManualDefenseOverride = _manualDefenseMode.value,
                         onProgress = { _, _, moveFound ->
                             if (moveFound != null) {
                                 latestFoundMove = moveFound
@@ -420,7 +494,7 @@ object FloatingStateHolder {
                         }
                     )
 
-                    // STRICT 10-SECOND GUARANTEE: Wait for the full 10,000ms duration
+                    // STRICT 5-SECOND GUARANTEE: Wait for the full 5,000ms duration
                     val elapsedMs = System.currentTimeMillis() - startMs
                     val remainingMs = (limitSec * 1000L) - elapsedMs
                     if (remainingMs > 0) {
@@ -471,6 +545,9 @@ object FloatingStateHolder {
                             onComplete?.invoke(errResult)
                         } catch (_: Throwable) {}
                     }
+                } finally {
+                    _isAnalyzing.value = false
+                    _analysisCountdownSec.value = 0
                 }
             }
         } catch (e: Throwable) {
@@ -483,6 +560,7 @@ object FloatingStateHolder {
     fun applyBestMove() {
         val move = _bestMove.value ?: return
         currentBoard.makeMove(move)
+        recordBlueMoveMade(move.from, move.to)
         _boardState.value = currentBoard.pieces.clone()
         _bestMove.value = null
         _lastActionMessage.value = "Applied move ${move.from} → ${move.to}"

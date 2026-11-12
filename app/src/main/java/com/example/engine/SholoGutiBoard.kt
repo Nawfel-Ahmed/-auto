@@ -90,6 +90,18 @@ class SholoGutiBoard {
         return stepMoves
     }
 
+    /**
+     * Absolute Legal Move Audit:
+     * Verifies that a given move exists strictly within the verified legal moves of the board.
+     * Prevents diagonal teleports and illegal off-grid or blocked path movements.
+     */
+    fun isMoveStrictlyLegal(player: Piece, move: GutiMove): Boolean {
+        val legalMoves = generateMoves(player)
+        return legalMoves.any {
+            it.from == move.from && it.to == move.to && it.captured == move.captured && it.totalCaptures == move.totalCaptures
+        }
+    }
+
     private fun findChainJumpsFrom(
         startNode: Int,
         firstTo: Int,
@@ -109,6 +121,8 @@ class SholoGutiBoard {
                 if (rule.from == currentNode &&
                     pieces[rule.over] == opponent &&
                     pieces[rule.to] == Piece.EMPTY &&
+                    rule.to != startNode &&
+                    !intermediates.contains(rule.to) &&
                     !capturedList.contains(rule.over)
                 ) {
                     continued = true
@@ -374,7 +388,7 @@ class SholoGutiBoard {
             screenWidth: Float,
             screenHeight: Float,
             scaleFactor: Float = 0.886f,
-            verticalOffset: Float = 0.4764f,
+            verticalOffset: Float = 0.4585f,
             horizontalOffset: Float = 0.50f,
             verticalScale: Float = 1.00f,
             triangleRatio: Float = 1.00f,

@@ -326,11 +326,12 @@ object ScreenCaptureManager {
             val radiusFactor = FloatingStateHolder.nodeRadiusFactor.value
 
             val u = (screenWidth * (scale / 4.0f))
-            val sampleRadius = (u * 0.18f * radiusFactor).toInt().coerceIn(7, 28)
-            val coreRadiusSq = (sampleRadius * 0.48f) * (sampleRadius * 0.48f)
+            val sampleRadius = (u * 0.18f * radiusFactor).toInt().coerceIn(7, 32)
+            val coreRadiusSq = (sampleRadius * 0.45f) * (sampleRadius * 0.45f)
 
             val detectedPieces = Array(SholoGutiBoard.TOTAL_NODES) { Piece.EMPTY }
-            val hsv = FloatArray(3)
+            val redConfidence = FloatArray(SholoGutiBoard.TOTAL_NODES)
+            val blueConfidence = FloatArray(SholoGutiBoard.TOTAL_NODES)
 
             for (i in 0 until SholoGutiBoard.TOTAL_NODES) {
                 if (bitmap.isRecycled) return null
@@ -377,32 +378,24 @@ object ScreenCaptureManager {
                                     val g = Color.green(pixel)
                                     val b = Color.blue(pixel)
 
-                                    val sum = (r + g + b).coerceAtLeast(1)
-                                    val rNorm = r.toFloat() / sum
-                                    val bNorm = b.toFloat() / sum
-
-                                    Color.RGBToHSV(r, g, b, hsv)
-                                    val hue = hsv[0]
-                                    val sat = hsv[1]
-                                    val value = hsv[2]
-
                                     val isCore = (distSq <= coreRadiusSq)
                                     allSamples++
                                     if (isCore) coreSamples++
 
-                                    // 1. User Pieces: Vibrant Blue / Cyan / Royal Blue
-                                    // Blue channel must dominate over red & green.
-                                    val isBluePixel = (bNorm >= 0.40f && b >= 75 && (b - r) >= 20 && (b - g) >= 10 && b > (r * 1.20f)) ||
-                                            (hue in 178f..265f && sat >= 0.28f && value >= 0.20f && b > r && b > (g * 0.95f))
+                                    val maxVal = maxOf(r, maxOf(g, b))
+                                    val minVal = minOf(r, minOf(g, b))
+                                    val delta = maxVal - minVal
+                                    val sat = if (maxVal == 0) 0f else delta.toFloat() / maxVal
 
-                                    // 2. Opponent Pieces: Pure Crimson / Scarlet / Ruby Red
-                                    // STRICT Wood Rejection:
-                                    // Wood boards have hue ~18°..50° and rNorm ~0.38..0.45.
-                                    // True red beads have hue strictly in 340°..360° or 0°..14°, rNorm >= 0.48, and r - g >= 32.
-                                    val isWoodHue = (hue in 15f..55f)
-                                    val isRedPixel = !isWoodHue &&
-                                            ((rNorm >= 0.48f && r >= 88 && (r - g) >= 32 && (r - b) >= 32 && r > (g * 1.40f) && r > (b * 1.40f)) ||
-                                                    ((hue >= 342f || hue <= 14f) && sat >= 0.38f && value >= 0.22f && r > (g * 1.35f) && r > (b * 1.35f)))
+                                    // 1. User Pieces: Royal Blue tokens
+                                    // Robust against anti-aliasing and textures; distinguishes strictly from wood (where R > B) and cyan/selection rings (where B - G < 20)
+                                    val isBluePixel = (b >= 125 && b - r >= 45 && b - g >= 25) ||
+                                            (b >= 115 && sat >= 0.35f && b > r * 1.35f && b > g * 1.20f)
+
+                                    // 2. Opponent Pieces: Crimson Red tokens
+                                    // Robust against embossed textures/stars and shading; distinguishes strictly from wood (where R - G is low, <= 35)
+                                    val isRedPixel = (r >= 135 && r - g >= 45 && r - b >= 45) ||
+                                            (r >= 120 && sat >= 0.40f && r > g * 1.35f && r > b * 1.35f)
 
                                     if (isBluePixel) {
                                         allBlueVotes++
@@ -419,32 +412,174 @@ object ScreenCaptureManager {
                 }
 
                 val allBlueRatio = allBlueVotes.toFloat() / allSamples.coerceAtLeast(1)
-                val allRedRatio = allRedVotes.toFloat() / allSamples.coerceAtLeast(1)
                 val coreBlueRatio = coreBlueVotes.toFloat() / coreSamples.coerceAtLeast(1)
+                val allRedRatio = allRedVotes.toFloat() / allSamples.coerceAtLeast(1)
                 val coreRedRatio = coreRedVotes.toFloat() / coreSamples.coerceAtLeast(1)
 
-                // Decision: Strictly distinguish User Blue, Opponent Red, and Empty nodes
-                val isBlueNode = ((coreBlueRatio >= 0.25f && allBlueRatio >= 0.18f) || (allBlueRatio >= 0.32f)) &&
-                        (allBlueRatio > (allRedRatio * 2.0f)) &&
-                        (allBlueVotes >= 5)
+                // Decision: Mutually exclusive, highly accurate piece classification (immune to false drops)
+                val isBlueNode = (coreBlueRatio >= 0.20f || (coreBlueRatio >= 0.14f && allBlueRatio >= 0.14f)) &&
+                        (allBlueVotes >= 14) &&
+                        (allBlueVotes >= (allRedVotes * 2.2f).toInt())
 
-                val isRedNode = ((coreRedRatio >= 0.25f && allRedRatio >= 0.18f) || (allRedRatio >= 0.32f)) &&
-                        (allRedRatio > (allBlueRatio * 2.0f)) &&
-                        (allRedVotes >= 5)
+                val isRedNode = (coreRedRatio >= 0.20f || (coreRedRatio >= 0.14f && allRedRatio >= 0.14f)) &&
+                        (allRedVotes >= 14) &&
+                        (allRedVotes >= (allBlueVotes * 2.2f).toInt())
 
                 val piece = when {
-                    isBlueNode -> Piece.BLUE
-                    isRedNode -> Piece.RED
+                    isBlueNode && !isRedNode -> Piece.BLUE
+                    isRedNode && !isBlueNode -> Piece.RED
                     else -> Piece.EMPTY
                 }
 
                 detectedPieces[i] = piece
+                redConfidence[i] = allRedRatio + coreRedRatio
+                blueConfidence[i] = allBlueRatio + coreBlueRatio
+            }
+
+            // Ground-Truth Game Score Synchronization:
+            // Ensures piece counts are 100% synchronized with reality before Minimax evaluation
+            val (compScore, userScore) = readGameScoresFromBitmap(bitmap)
+            if (compScore != null && userScore != null) {
+                val targetBlue = (16 - compScore).coerceIn(0, 16)
+                val targetRed = (16 - userScore).coerceIn(0, 16)
+
+                var curBlue = detectedPieces.count { it == Piece.BLUE }
+                var curRed = detectedPieces.count { it == Piece.RED }
+
+                if (curBlue < targetBlue && kotlin.math.abs(curBlue - targetBlue) <= 2) {
+                    val candidateIndices = (0 until SholoGutiBoard.TOTAL_NODES)
+                        .filter { detectedPieces[it] == Piece.EMPTY }
+                        .sortedByDescending { blueConfidence[it] }
+                    for (idx in candidateIndices.take(targetBlue - curBlue)) {
+                        detectedPieces[idx] = Piece.BLUE
+                    }
+                } else if (curBlue > targetBlue && kotlin.math.abs(curBlue - targetBlue) <= 2) {
+                    val toDrop = (0 until SholoGutiBoard.TOTAL_NODES)
+                        .filter { detectedPieces[it] == Piece.BLUE }
+                        .sortedBy { blueConfidence[it] }
+                    for (idx in toDrop.take(curBlue - targetBlue)) {
+                        detectedPieces[idx] = Piece.EMPTY
+                    }
+                }
+
+                if (curRed < targetRed && kotlin.math.abs(curRed - targetRed) <= 2) {
+                    val candidateIndices = (0 until SholoGutiBoard.TOTAL_NODES)
+                        .filter { detectedPieces[it] == Piece.EMPTY }
+                        .sortedByDescending { redConfidence[it] }
+                    for (idx in candidateIndices.take(targetRed - curRed)) {
+                        detectedPieces[idx] = Piece.RED
+                    }
+                } else if (curRed > targetRed && kotlin.math.abs(curRed - targetRed) <= 2) {
+                    val toDrop = (0 until SholoGutiBoard.TOTAL_NODES)
+                        .filter { detectedPieces[it] == Piece.RED }
+                        .sortedBy { redConfidence[it] }
+                    for (idx in toDrop.take(curRed - targetRed)) {
+                        detectedPieces[idx] = Piece.EMPTY
+                    }
+                }
             }
 
             return detectedPieces
         } catch (e: Throwable) {
             e.printStackTrace()
             return null
+        }
+    }
+
+    /**
+     * Reads ground truth scores from top ("Computer Score: X") and bottom ("You Score: Y") headers.
+     * In 16 Ghuti:
+     * - Computer Score = X means Computer has captured X Blue pieces -> Blue remaining = 16 - X.
+     * - You Score = Y means You have captured Y Red pieces -> Red remaining = 16 - Y.
+     */
+    fun readGameScoresFromBitmap(bitmap: Bitmap): Pair<Int?, Int?> {
+        val w = screenWidth
+        val h = screenHeight
+        if (bitmap.isRecycled || bitmap.width < 10 || bitmap.height < 10) return Pair(null, null)
+
+        fun parseScoreFromRegion(yRange: IntRange, xRange: IntRange): Int? {
+            val whitePts = mutableListOf<Pair<Int, Int>>()
+            for (y in yRange) {
+                for (x in xRange) {
+                    if (x in 0 until bitmap.width && y in 0 until bitmap.height) {
+                        val pixel = bitmap.getPixel(x, y)
+                        val r = Color.red(pixel)
+                        val g = Color.green(pixel)
+                        val b = Color.blue(pixel)
+                        if (r > 205 && g > 205 && b > 205) {
+                            whitePts.add(Pair(x, y))
+                        }
+                    }
+                }
+            }
+            if (whitePts.size < 15) return null
+
+            val xs = whitePts.map { it.first }
+            val minX = xs.minOrNull() ?: return null
+            val maxX = xs.maxOrNull() ?: return null
+            val colCounts = IntArray(maxX - minX + 1)
+            for (pt in whitePts) {
+                colCounts[pt.first - minX]++
+            }
+
+            var colonX = -1
+            for (i in 0 until (colCounts.size - 4)) {
+                if (colCounts[i] <= 1 && colCounts[i + 1] in 2..6 && colCounts[i + 2] in 2..6 && colCounts[i + 4] <= 1) {
+                    colonX = minX + i + 1
+                    break
+                }
+            }
+            val digitPts = if (colonX != -1) {
+                whitePts.filter { it.first > colonX + 2 }
+            } else {
+                whitePts.filter { it.first > minX + (maxX - minX) * 0.45f }
+            }
+            if (digitPts.size < 15) return null
+
+            val dMinX = digitPts.minOf { it.first }
+            val dMaxX = digitPts.maxOf { it.first }
+            val dMinY = digitPts.minOf { it.second }
+            val dMaxY = digitPts.maxOf { it.second }
+            val dw = (dMaxX - dMinX + 1).coerceAtLeast(1)
+            val dh = (dMaxY - dMinY + 1).coerceAtLeast(1)
+
+            val grid = Array(5) { IntArray(4) }
+            for (pt in digitPts) {
+                val gx = (((pt.first - dMinX) * 4) / dw).coerceIn(0, 3)
+                val gy = (((pt.second - dMinY) * 5) / dh).coerceIn(0, 4)
+                grid[gy][gx]++
+            }
+
+            val total = digitPts.size.coerceAtLeast(1)
+            val midHole = (grid[2][1] + grid[2][2]).toFloat() / total
+            val topBar = grid[0].sum()
+            val botBar = grid[4].sum()
+            val leftMid = grid[2][0]
+            val rightMid = grid[2][3]
+
+            return when {
+                midHole < 0.14f && leftMid > 15 && rightMid > 15 -> 0
+                dw.toFloat() / dh < 0.40f -> 1
+                rightMid > leftMid && topBar > 40 && botBar > 50 -> 5
+                midHole > 0.15f && leftMid > 20 && rightMid > 20 -> 8
+                rightMid > leftMid * 1.8f -> 3
+                topBar > 60 && botBar < 30 -> 7
+                else -> null
+            }
+        }
+
+        return try {
+            val topScore = parseScoreFromRegion(
+                yRange = (h * 0.040f).toInt()..(h * 0.070f).toInt(),
+                xRange = (w * 0.62f).toInt()..(w * 0.82f).toInt()
+            )
+            val botScore = parseScoreFromRegion(
+                yRange = (h * 0.875f).toInt()..(h * 0.915f).toInt(),
+                xRange = (w * 0.62f).toInt()..(w * 0.82f).toInt()
+            )
+            Pair(topScore, botScore)
+        } catch (_: Throwable) {
+            Pair(null, null)
         }
     }
 

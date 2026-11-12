@@ -112,6 +112,12 @@ fun FloatingScreen(
     val isAlignModeActive by viewModel.isAlignModeActive.collectAsStateWithLifecycle()
     val isAutoHintEnabled by viewModel.isAutoHintEnabled.collectAsStateWithLifecycle()
     val isAutoClickerEnabled by viewModel.isAutoClickerEnabled.collectAsStateWithLifecycle()
+    val manualDefenseMode by viewModel.manualDefenseMode.collectAsStateWithLifecycle()
+    val overlayAlpha by viewModel.overlayAlpha.collectAsStateWithLifecycle()
+
+    val liveWinProbability by viewModel.liveWinProbability.collectAsStateWithLifecycle()
+    val advantageText by viewModel.advantageText.collectAsStateWithLifecycle()
+    val moveHistory by viewModel.moveHistory.collectAsStateWithLifecycle()
 
     Scaffold(
         topBar = {
@@ -293,6 +299,82 @@ fun FloatingScreen(
                 }
             }
 
+            // Match History & Live Advantage Tracker Card
+            item {
+                Card(
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF131D2E)),
+                    border = BorderStroke(
+                        1.dp,
+                        if (liveWinProbability >= 50) Color(0xFF00E676).copy(alpha = 0.5f) else Color(0xFFFF5252).copy(alpha = 0.5f)
+                    ),
+                    modifier = Modifier.fillMaxWidth().testTag("match_tracker_card")
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column {
+                                Text(
+                                    text = "Live Match Tracker & Advantage",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = advantageText,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (liveWinProbability >= 50) Color(0xFF00E676) else Color(0xFFFF5252)
+                                )
+                            }
+
+                            // Win Probability Badge
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(if (liveWinProbability >= 50) Color(0xFF003314) else Color(0xFF3B1214))
+                                    .padding(horizontal = 12.dp, vertical = 6.dp)
+                            ) {
+                                Text(
+                                    text = "$liveWinProbability% WIN",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = if (liveWinProbability >= 50) Color(0xFF00E676) else Color(0xFFFF5252)
+                                )
+                            }
+                        }
+
+                        if (moveHistory.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                text = "Recent Moves (${moveHistory.size} total):",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF94A3B8)
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            for (record in moveHistory.takeLast(3).reversed()) {
+                                Text(
+                                    text = "• #${record.moveNumber}: ${record.description}",
+                                    fontSize = 11.sp,
+                                    color = Color(0xFFCBD5E1),
+                                    modifier = Modifier.padding(vertical = 1.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
             // Auto-Trigger Opponent Move Detection Card
             item {
                 Card(
@@ -423,6 +505,192 @@ fun FloatingScreen(
                             ),
                             modifier = Modifier.testTag("auto_clicker_toggle_switch")
                         )
+                    }
+                }
+            }
+
+            // Engine Strategy & Tactical Mode Card (Normal vs Defense vs Smart Auto)
+            item {
+                Card(
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF131D2E)),
+                    border = BorderStroke(
+                        1.dp,
+                        when (manualDefenseMode) {
+                            true -> Color(0xFFEF4444).copy(alpha = 0.6f)
+                            false -> Color(0xFF10B981).copy(alpha = 0.6f)
+                            null -> Color(0xFF38BDF8).copy(alpha = 0.6f)
+                        }
+                    ),
+                    modifier = Modifier.fillMaxWidth().testTag("engine_strategy_mode_card")
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column {
+                                Text(
+                                    text = "Tactical Mode & Strategy",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                )
+                                Text(
+                                    text = when (manualDefenseMode) {
+                                        true -> "🛡️ Defense Mode Forced (Zero piece loss & clock survival)"
+                                        false -> "⚔️ Normal Mode Forced (Aggressive traps & tactical forks)"
+                                        null -> "🤖 Smart Auto Mode (Auto-Defends when ahead by 3+ points)"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = when (manualDefenseMode) {
+                                        true -> Color(0xFFFCA5A5)
+                                        false -> Color(0xFF6EE7B7)
+                                        null -> Color(0xFF93C5FD)
+                                    }
+                                )
+                            }
+                        }
+
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            // Smart Auto Mode Chip
+                            FilterChip(
+                                selected = (manualDefenseMode == null),
+                                onClick = { viewModel.setManualDefenseMode(null) },
+                                label = { Text("🤖 Smart Auto", fontSize = 11.sp, fontWeight = FontWeight.Bold) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = Color(0xFF1E3A8A),
+                                    selectedLabelColor = Color(0xFF93C5FD),
+                                    containerColor = Color(0xFF1E293B),
+                                    labelColor = Color(0xFF94A3B8)
+                                ),
+                                modifier = Modifier.weight(1f).testTag("mode_auto_chip")
+                            )
+
+                            // Normal Mode Chip
+                            FilterChip(
+                                selected = (manualDefenseMode == false),
+                                onClick = { viewModel.setManualDefenseMode(false) },
+                                label = { Text("⚔️ Normal", fontSize = 11.sp, fontWeight = FontWeight.Bold) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = Color(0xFF064E3B),
+                                    selectedLabelColor = Color(0xFF6EE7B7),
+                                    containerColor = Color(0xFF1E293B),
+                                    labelColor = Color(0xFF94A3B8)
+                                ),
+                                modifier = Modifier.weight(1f).testTag("mode_normal_chip")
+                            )
+
+                            // Defense Mode Chip
+                            FilterChip(
+                                selected = (manualDefenseMode == true),
+                                onClick = { viewModel.setManualDefenseMode(true) },
+                                label = { Text("🛡️ Defend", fontSize = 11.sp, fontWeight = FontWeight.Bold) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = Color(0xFF450A0A),
+                                    selectedLabelColor = Color(0xFFFCA5A5),
+                                    containerColor = Color(0xFF1E293B),
+                                    labelColor = Color(0xFF94A3B8)
+                                ),
+                                modifier = Modifier.weight(1f).testTag("mode_defense_chip")
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Floating Window Opacity / Transparency (Japsa) Card
+            item {
+                Card(
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF131D2E)),
+                    border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.5f)),
+                    modifier = Modifier.fillMaxWidth().testTag("overlay_opacity_card")
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column {
+                                Text(
+                                    text = "Assistant Opacity / Transparency (Japsa)",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                )
+                                Text(
+                                    text = "Adjust background visibility so the game board underneath is 100% visible",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF94A3B8)
+                                )
+                            }
+                            Text(
+                                text = "${(overlayAlpha * 100).toInt()}%",
+                                fontWeight = FontWeight.ExtraBold,
+                                fontSize = 14.sp,
+                                color = Color(0xFF38BDF8)
+                            )
+                        }
+
+                        Slider(
+                            value = overlayAlpha,
+                            onValueChange = { viewModel.setOverlayAlpha(it) },
+                            valueRange = 0.20f..1.0f,
+                            colors = SliderDefaults.colors(
+                                thumbColor = Color(0xFF38BDF8),
+                                activeTrackColor = Color(0xFF0284C7),
+                                inactiveTrackColor = Color(0xFF1E293B)
+                            ),
+                            modifier = Modifier.testTag("opacity_slider")
+                        )
+
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            listOf(
+                                0.35f to "35% Japsa",
+                                0.60f to "60% Clear",
+                                0.85f to "85% Optimal",
+                                1.00f to "100% Solid"
+                            ).forEach { (valAlpha, label) ->
+                                OutlinedButton(
+                                    onClick = { viewModel.setOverlayAlpha(valAlpha) },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                    colors = ButtonDefaults.outlinedButtonColors(
+                                        containerColor = if (kotlin.math.abs(overlayAlpha - valAlpha) < 0.05f) Color(0xFF0C4A6E) else Color(0xFF0F172A)
+                                    ),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (kotlin.math.abs(overlayAlpha - valAlpha) < 0.05f) Color(0xFF38BDF8) else Color(0xFF334155)
+                                    ),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text(
+                                        text = label,
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (kotlin.math.abs(overlayAlpha - valAlpha) < 0.05f) Color(0xFF38BDF8) else Color(0xFFCBD5E1)
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
